@@ -1,5 +1,6 @@
 #include "vpack/crypto.h"
 #include <cstring>
+#include <intrin.h>
 
 namespace vpack::crypto {
 
@@ -40,24 +41,24 @@ uint64_t fnv1a_64_ci(const char* str) noexcept {
 void rolling_encrypt(uint8_t* buffer, size_t size, uint64_t key) noexcept {
     uint64_t state = key ^ 0x7361626C655F766DULL;
     for (size_t i = 0; i < size; ++i) {
-        state = rotl64(state, 13) + 0x9E3779B97F4A7C15ULL;
-        uint8_t kbyte = static_cast<uint8_t>((state ^ (state >> 29)) & 0xFF);
+        state = mba_add(rotl64(state, 13), 0x9E3779B97F4A7C15ULL);
+        uint8_t kbyte = static_cast<uint8_t>(mba_xor(state, state >> 29) & 0xFFULL);
         uint8_t plain = buffer[i];
         uint8_t enc   = static_cast<uint8_t>(((plain ^ kbyte) + static_cast<uint8_t>(i & 0xFF)) & 0xFF);
         buffer[i]     = enc;
-        state ^= static_cast<uint64_t>(plain) * 0xBF58476D1CE4E5B9ULL;
+        state = mba_xor(state, static_cast<uint64_t>(plain) * 0xBF58476D1CE4E5B9ULL);
     }
 }
 
 void rolling_decrypt(uint8_t* buffer, size_t size, uint64_t key) noexcept {
     uint64_t state = key ^ 0x7361626C655F766DULL;
     for (size_t i = 0; i < size; ++i) {
-        state = rotl64(state, 13) + 0x9E3779B97F4A7C15ULL;
-        uint8_t kbyte = static_cast<uint8_t>((state ^ (state >> 29)) & 0xFF);
+        state = mba_add(rotl64(state, 13), 0x9E3779B97F4A7C15ULL);
+        uint8_t kbyte = static_cast<uint8_t>(mba_xor(state, state >> 29) & 0xFFULL);
         uint8_t enc   = buffer[i];
         uint8_t plain = static_cast<uint8_t>(((enc - static_cast<uint8_t>(i & 0xFF)) & 0xFF) ^ kbyte);
         buffer[i]     = plain;
-        state ^= static_cast<uint64_t>(plain) * 0xBF58476D1CE4E5B9ULL;
+        state = mba_xor(state, static_cast<uint64_t>(plain) * 0xBF58476D1CE4E5B9ULL);
     }
 }
 
@@ -100,6 +101,8 @@ void chacha20_xor(uint8_t* data, size_t size, const uint8_t key[32], const uint8
         offset += chunk;
         state[12]++;
     }
+    secure_wipe(block, sizeof(block), counter);
+    secure_wipe(working, sizeof(working), counter ^ 0x5A5A5A5Au);
 }
 
 void xtea_encrypt(uint32_t v[2], const uint32_t key[4], uint32_t rounds) noexcept {
@@ -124,6 +127,21 @@ void xtea_decrypt(uint32_t v[2], const uint32_t key[4], uint32_t rounds) noexcep
     }
     v[0] = v0;
     v[1] = v1;
+}
+
+void secure_wipe(void* ptr, size_t size, uint64_t noise_seed) noexcept {
+    if (!ptr || size == 0) return;
+    volatile uint8_t* p = static_cast<volatile uint8_t*>(ptr);
+    uint64_t s = noise_seed ^ __rdtsc() ^ 0x9E3779B97F4A7C15ULL;
+    // Pass 1: Overwrite with non-linear pseudo-random stream (Synthesize & Squash)
+    for (size_t i = 0; i < size; ++i) {
+        s = rotl64(s, 11) + 0xBF58476D1CE4E5B9ULL;
+        p[i] = static_cast<uint8_t>((s ^ (s >> 27)) & 0xFFu);
+    }
+    // Pass 2: Zero out so neither plaintext nor recognizable patterns remain
+    for (size_t i = 0; i < size; ++i) {
+        p[i] = 0;
+    }
 }
 
 } // namespace vpack::crypto

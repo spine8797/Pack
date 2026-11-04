@@ -190,13 +190,17 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
         // mov rsi, [rax + 0x10] (ImageBase)
         emit({0x48, 0x8B, 0x70, 0x10});
 
-        // Branchless Anti-Debug key perturbation in r9
+        // Branchless Anti-Debug key perturbation in r9 (PEB->BeingDebugged + KUSER_SHARED_DATA->KdDebuggerEnabled)
         if (enable_anti_debug) {
-            emit({0x0F, 0xB6, 0x40, 0x02}); // movzx eax, byte ptr [rax + 0x02]
-            emit({0x48, 0xC1, 0xE0, 0x0D}); // shl rax, 13
-            emit({0x49, 0x89, 0xC1});       // mov r9, rax
+            emit({0x0F, 0xB6, 0x40, 0x02});             // movzx eax, byte ptr [rax + 0x02] (PEB->BeingDebugged)
+            emit({0x48, 0xC1, 0xE0, 0x0D});             // shl rax, 13
+            emit({0x49, 0x89, 0xC1});                   // mov r9, rax
+            emit({0x0F, 0xB6, 0x04, 0x25, 0xD4, 0x02, 0xFE, 0x7F}); // movzx eax, byte ptr [0x7FFE02D4] (KdDebuggerEnabled)
+            emit({0x83, 0xE0, 0x01});                   // and eax, 1
+            emit({0x48, 0xC1, 0xE0, 0x11});             // shl rax, 17
+            emit({0x49, 0x31, 0xC1});                   // xor r9, rax
         } else {
-            emit({0x4D, 0x31, 0xC9});       // xor r9, r9
+            emit({0x4D, 0x31, 0xC9});                   // xor r9, r9
         }
 
         // lea r8, [rbx + 0x30] (&regions[0])
@@ -332,11 +336,15 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
         const size_t jz_next_desc_pos = stage2.size();
         emit({0x74, 0x00}); // jz lbl_next_desc
 
+        // xor rdi, rdi (will hold &IMAGE_IMPORT_BY_NAME if imported by name)
+        emit({0x48, 0x31, 0xFF});
         // bt rax, 63 (check IMAGE_ORDINAL_FLAG64)
         emit({0x48, 0x0F, 0xBA, 0xE0, 0x3F});
-        emit({0x72, 0x07}); // jc by_ordinal (+7)
-        // lea rdx, [rsi + rax + 2] (&IMAGE_IMPORT_BY_NAME->Name)
-        emit({0x48, 0x8D, 0x54, 0x06, 0x02});
+        emit({0x72, 0x0A}); // jc by_ordinal (+10)
+        // lea rdi, [rsi + rax] (IMAGE_IMPORT_BY_NAME*)
+        emit({0x48, 0x8D, 0x3C, 0x06});
+        // lea rdx, [rdi + 2] (&IMAGE_IMPORT_BY_NAME->Name)
+        emit({0x48, 0x8D, 0x57, 0x02});
         emit({0xEB, 0x03}); // jmp do_getproc (+3)
         // by_ordinal: movzx edx, ax
         emit({0x0F, 0xB7, 0xD0});
@@ -345,8 +353,24 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
         emit({0x4C, 0x89, 0xE9});
         // call qword ptr [rbx + kSynthIatOffset + 8] (GetProcAddress)
         emit({0xFF, 0x93, 0x50, 0x09, 0x00, 0x00});
-        // mov qword ptr [r15], rax (*iat = proc)
+        // Wipe ILT entry first: mov qword ptr [r14], 0
+        emit({0x49, 0xC7, 0x06, 0x00, 0x00, 0x00, 0x00});
+        // Write resolved proc to IAT: mov qword ptr [r15], rax (*iat = proc)
         emit({0x49, 0x89, 0x07});
+
+        // Wipe IMAGE_IMPORT_BY_NAME (2-byte Hint + ASCII function name) in RAM
+        emit({0x48, 0x85, 0xFF});             // test rdi, rdi
+        emit({0x74, 0x16});                   // jz skip_fn_wipe (+22)
+        emit({0x66, 0xC7, 0x07, 0x00, 0x00}); // mov word ptr [rdi], 0 (Hint)
+        emit({0x48, 0x83, 0xC7, 0x02});       // add rdi, 2
+        // lbl_wipe_fn_char:
+        emit({0x80, 0x3F, 0x00});             // cmp byte ptr [rdi], 0
+        emit({0x74, 0x08});                   // jz skip_fn_wipe (+8)
+        emit({0xC6, 0x07, 0x00});             // mov byte ptr [rdi], 0
+        emit({0x48, 0xFF, 0xC7});             // inc rdi
+        emit({0xEB, 0xF3});                   // jmp lbl_wipe_fn_char (-13)
+        // skip_fn_wipe:
+
         // add r14, 8
         emit({0x49, 0x83, 0xC6, 0x08});
         // add r15, 8
@@ -356,10 +380,25 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
 
         const size_t lbl_next_desc = stage2.size();
         stage2[jz_next_desc_pos + 1] = static_cast<uint8_t>(lbl_next_desc - (jz_next_desc_pos + 2));
-        // Wipe IMAGE_IMPORT_DESCRIPTOR OriginalFirstThunk & Name RVA in RAM after resolving DLL
+
+        // Wipe entire DLL name string (any length) in RAM so Scylla/ImpRec cannot scan it
+        emit({0x41, 0x8B, 0x44, 0x24, 0x0C}); // mov eax, dword ptr [r12 + 0x0C] (desc->Name RVA)
+        emit({0x48, 0x8D, 0x3C, 0x06});       // lea rdi, [rsi + rax] (dll_name string)
+        // lbl_wipe_dll_char:
+        emit({0x80, 0x3F, 0x00});             // cmp byte ptr [rdi], 0
+        emit({0x74, 0x08});                   // jz skip_dll_wipe (+8)
+        emit({0xC6, 0x07, 0x00});             // mov byte ptr [rdi], 0
+        emit({0x48, 0xFF, 0xC7});             // inc rdi
+        emit({0xEB, 0xF3});                   // jmp lbl_wipe_dll_char (-13)
+        // skip_dll_wipe:
+
+        // Wipe entire IMAGE_IMPORT_DESCRIPTOR (20 bytes) in RAM after resolving DLL
         emit({0x31, 0xC0});                   // xor eax, eax
-        emit({0x41, 0x89, 0x04, 0x24});       // mov dword ptr [r12], eax
+        emit({0x41, 0x89, 0x04, 0x24});       // mov dword ptr [r12 + 0x00], eax
+        emit({0x41, 0x89, 0x44, 0x24, 0x04}); // mov dword ptr [r12 + 0x04], eax
+        emit({0x41, 0x89, 0x44, 0x24, 0x08}); // mov dword ptr [r12 + 0x08], eax
         emit({0x41, 0x89, 0x44, 0x24, 0x0C}); // mov dword ptr [r12 + 0x0C], eax
+        emit({0x41, 0x89, 0x44, 0x24, 0x10}); // mov dword ptr [r12 + 0x10], eax
         // add r12, 20
         emit({0x49, 0x83, 0xC4, 0x14});
         int32_t rel_desc_loop = static_cast<int32_t>(lbl_desc_loop) - static_cast<int32_t>(stage2.size() + 5);
@@ -769,6 +808,24 @@ PackResult PeImage::pack(const PackOptions& opts) {
     vhdr.orig_pdata_rva       = 0;
     vhdr.orig_pdata_size      = 0;
     vhdr.orig_import_rva      = seed_lo; // 0 ^ seed_lo
+    vhdr.vcode_rva            = seed_lo; // 0 ^ seed_lo
+    vhdr.vcode_size           = seed_hi; // 0 ^ seed_hi
+    vhdr.vcode_jit_tag        = 0;
+
+    for (WORD i = 0; i < num_sec; ++i) {
+        char sname[9]{};
+        std::memcpy(sname, first_sec[i].Name, 8);
+        if (std::strcmp(sname, ".vcode") == 0) {
+            uint32_t vc_size = first_sec[i].Misc.VirtualSize;
+            if (vc_size == 0 || vc_size > first_sec[i].SizeOfRawData) {
+                vc_size = first_sec[i].SizeOfRawData;
+            }
+            vhdr.vcode_rva     = first_sec[i].VirtualAddress ^ seed_lo;
+            vhdr.vcode_size    = vc_size ^ seed_hi;
+            vhdr.vcode_jit_tag = static_cast<uint32_t>(seed ^ 0x4A495456ULL);
+            break;
+        }
+    }
 
     // 2. Hook first TLS Callback if present so .text is decrypted BEFORE TLS initializers execute
     const auto& tls_dir_entry = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];

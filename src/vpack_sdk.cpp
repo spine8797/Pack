@@ -13,10 +13,10 @@ bool     Protector::headers_erased_ = false;
 
 namespace {
 
-// Registers decrypted .pdata unwind table, wipes the entire .vpack section (Stage 1, Synthetic Imports,
-// VPackHeader) leaving only a 1-byte RET at TlsStub, and restores strict RX / R section permissions
-// so zero RWX pages remain in process memory!
-bool finalize_vpack_section_in_memory() noexcept {
+// Registers decrypted .pdata unwind table, initializes the JIT Execute & Wipe vault for .vcode (.sbl1),
+// wipes the entire .vpack section (Stage 1, Synthetic Imports, VPackHeader) leaving only a 1-byte RET
+// at TlsStub, and restores strict RX / R section permissions so zero RWX pages remain in process memory!
+bool finalize_vpack_section_in_memory(uint32_t flags) noexcept {
     auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     if (!base) return false;
 
@@ -35,20 +35,32 @@ bool finalize_vpack_section_in_memory() noexcept {
     static auto fn_vprotect = VPACK_IMPORT(FnVirtualProtect, "kernel32.dll", "VirtualProtect");
     static auto fn_add_ft   = VPACK_IMPORT(FnRtlAddFunctionTable, "kernel32.dll", "RtlAddFunctionTable");
 
-    bool found_vpack = false;
+    bool     found_vpack = false;
+    uint32_t vcode_rva   = 0;
+    uint32_t vcode_size  = 0;
+    uint64_t master_seed = 0x4A414E55535F4B59ULL;
+
     const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
     const WORD num_sec = nt->FileHeader.NumberOfSections;
 
-    for (WORD i = 0; i < num_sec; ++i, ++sec) {
-        uint8_t* sec_base = base + sec->VirtualAddress;
-        size_t   sec_size = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+    // Pass 1: Extract VPackHeader metadata & locate .vcode (even if masqueraded as .sbl*)
+    for (WORD i = 0; i < num_sec; ++i) {
+        const auto& s = sec[i];
+        uint8_t* sec_base = base + s.VirtualAddress;
+        size_t   sec_size = s.Misc.VirtualSize ? s.Misc.VirtualSize : s.SizeOfRawData;
         if (sec_size == 0) continue;
 
-        if (std::memcmp(sec->Name, ".vpack", 6) == 0) {
+        if (std::memcmp(s.Name, ".vpack", 6) == 0) {
             found_vpack = true;
             auto* vhdr = reinterpret_cast<VPackHeader*>(sec_base);
-            uint32_t expected_magic = static_cast<uint32_t>((vhdr->master_seed & 0xFFFFFFFFULL) ^ 0xFFFFFFFFULL) ^ VPACK_MAGIC;
+            uint32_t seed_lo = static_cast<uint32_t>(vhdr->master_seed & 0xFFFFFFFFULL);
+            uint32_t seed_hi = static_cast<uint32_t>((vhdr->master_seed >> 32) & 0xFFFFFFFFULL);
+            uint32_t expected_magic = (seed_lo ^ 0xFFFFFFFFu) ^ VPACK_MAGIC;
             if (vhdr->magic == expected_magic) {
+                master_seed = vhdr->master_seed;
+                vcode_rva   = vhdr->vcode_rva ^ seed_lo;
+                vcode_size  = vhdr->vcode_size ^ seed_hi;
+
                 if (vhdr->orig_pdata_rva != 0 && vhdr->orig_pdata_size >= sizeof(RUNTIME_FUNCTION) && fn_add_ft.get()) {
                     auto* fn_table = reinterpret_cast<PRUNTIME_FUNCTION>(base + vhdr->orig_pdata_rva);
                     DWORD entry_count = vhdr->orig_pdata_size / sizeof(RUNTIME_FUNCTION);
@@ -59,7 +71,7 @@ bool finalize_vpack_section_in_memory() noexcept {
             // Wipe 100% of .vpack (VPackHeader, Synthetic Imports "LoadLibraryA"/"GetProcAddress",
             // EP Stub, Stage 1, and Stage 2), leaving only a 1-byte RET (0xC3) at kTlsStubOffset (0xA40)
             // so DLL_PROCESS_DETACH exits cleanly!
-            std::memset(sec_base, 0, sec_size);
+            crypto::secure_wipe(sec_base, sec_size, master_seed);
             if (sec_size > 0xA40) {
                 sec_base[0xA40] = 0xC3; // ret
             }
@@ -68,23 +80,41 @@ bool finalize_vpack_section_in_memory() noexcept {
                 DWORD old_prot = 0;
                 fn_vprotect(sec_base, sec_size, PAGE_EXECUTE_READ, &old_prot);
             }
+        } else if (std::memcmp(s.Name, ".vcode", 6) == 0 && vcode_rva == 0) {
+            vcode_rva  = s.VirtualAddress;
+            vcode_size = static_cast<uint32_t>(sec_size);
+        }
+    }
+
+    // Pass 2: Restore strict non-writable permissions on code (.text) and read-only (.rdata, .pdata, .xdata, .idata)
+    for (WORD i = 0; i < num_sec; ++i) {
+        const auto& s = sec[i];
+        uint8_t* sec_base = base + s.VirtualAddress;
+        size_t   sec_size = s.Misc.VirtualSize ? s.Misc.VirtualSize : s.SizeOfRawData;
+        if (sec_size == 0 || std::memcmp(s.Name, ".vpack", 6) == 0) continue;
+
+        // Skip .vcode here if JIT vault will lock & encrypt it below
+        if ((flags & PROT_JIT_VCODE) && vcode_rva != 0 && s.VirtualAddress == vcode_rva) {
             continue;
         }
 
-        // Restore strict non-writable permissions on code (.text, .sbl1) and read-only (.rdata, .pdata, .xdata, .idata)
         if (fn_vprotect.get()) {
             DWORD old_prot = 0;
-            if (sec->Characteristics & IMAGE_SCN_CNT_CODE) {
+            if (s.Characteristics & IMAGE_SCN_CNT_CODE) {
                 // Convert RWX -> RX (PAGE_EXECUTE_READ)
                 fn_vprotect(sec_base, sec_size, PAGE_EXECUTE_READ, &old_prot);
-            } else if (std::memcmp(sec->Name, ".rdata", 6) == 0 ||
-                       std::memcmp(sec->Name, ".sbl5", 5) == 0 ||
-                       std::memcmp(sec->Name, ".sbl6", 5) == 0 ||
-                       std::memcmp(sec->Name, ".sbl8", 5) == 0) {
+            } else if (std::memcmp(s.Name, ".rdata", 6) == 0 ||
+                       std::memcmp(s.Name, ".sbl", 4) == 0) {
                 // Convert RW -> R (PAGE_READONLY)
                 fn_vprotect(sec_base, sec_size, PAGE_READONLY, &old_prot);
             }
         }
+    }
+
+    // Pass 3: Activate JIT Execute & Wipe Vault on .vcode (.sbl1) so protected functions and
+    // VM handlers remain encrypted & non-executable (PAGE_READONLY) at rest in RAM!
+    if ((flags & PROT_JIT_VCODE) && vcode_rva != 0 && vcode_size != 0) {
+        antidump::init_jit_vcode_vault(base + vcode_rva, vcode_size, master_seed, false);
     }
 
     return found_vpack;
@@ -95,7 +125,7 @@ bool finalize_vpack_section_in_memory() noexcept {
 RuntimeStatus Protector::initialize(uint32_t flags) noexcept {
     RuntimeStatus status{};
     status.active_flags = flags;
-    status.packed_binary = finalize_vpack_section_in_memory();
+    status.packed_binary = finalize_vpack_section_in_memory(flags);
 
     // Cache module layout, baseline .text hash, and loaded DLL list BEFORE erasing PE headers
     antidump::ModuleLayoutInfo layout{};
@@ -133,6 +163,10 @@ bool Protector::verify_environment(antidebug::DebugReport* out_report) noexcept 
         if (!antidump::verify_text_integrity(baseline_hash_, nullptr)) {
             rep.flags |= antidebug::THREAT_SOFTWARE_BREAKPOINT;
         }
+    }
+
+    if (!antidump::verify_vcode_integrity()) {
+        rep.flags |= antidebug::THREAT_VCODE_TAMPERED;
     }
 
     if (antidump::detect_injected_module(&rep.injected_module_base, rep.injected_module_name, sizeof(rep.injected_module_name))) {

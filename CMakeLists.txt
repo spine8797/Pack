@@ -88,6 +88,13 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/dll_injector.cpp")
     target_link_libraries(dll_injector PRIVATE vpack ${VPACK_SYS_LIBS})
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cracker_dump_sim.cpp")
+    add_executable(cracker_dump_sim
+        tests/cracker_dump_sim.cpp
+    )
+    target_link_libraries(cracker_dump_sim PRIVATE vpack ${VPACK_SYS_LIBS})
+endif()
+
 # 6. Optional: ACE Out-of-Process Emulator (only built if emu/ exists locally)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/emu/src/main.cpp")
     add_executable(emu

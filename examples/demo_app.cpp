@@ -9,12 +9,16 @@
 #include <string>
 #include <cstdlib>
 
-// Placed in the dedicated ".vcode" section (encrypted on disk when packed).
+// Placed in the dedicated ".vcode" section: remains encrypted & PAGE_READONLY
+// in RAM at rest, decrypted only inside VPACK_JIT_CALL and re-encrypted with a
+// mutated rolling key immediately upon return!
 VPACK_CODE uint64_t compute_protected_signature(uint64_t user_id, uint64_t salt) {
-    uint64_t state = user_id ^ 0x5341424C455F434FULL;
+    uint64_t state = vpack::crypto::mba_xor(user_id, 0x5341424C455F434FULL);
     for (int round = 0; round < 16; ++round) {
-        state = ((state << 11) | (state >> 53)) + (salt ^ static_cast<uint64_t>(round * 0x9E3779B9u));
-        state ^= 0xBF58476D1CE4E5B9ULL;
+        uint64_t rot  = (state << 11) | (state >> 53);
+        uint64_t term = vpack::crypto::mba_xor(salt, static_cast<uint64_t>(round * 0x9E3779B9u));
+        state = vpack::crypto::mba_add(rot, term);
+        state = vpack::crypto::mba_xor(state, 0xBF58476D1CE4E5B9ULL);
     }
     return state;
 }
@@ -22,32 +26,41 @@ VPACK_CODE uint64_t compute_protected_signature(uint64_t user_id, uint64_t salt)
 namespace {
 
 uint64_t native_mix_helper(uint64_t a, uint64_t b, uint64_t, uint64_t) {
-    return (a ^ (b * 0x9E3779B97F4A7C15ULL)) + 0x1337C0DEULL;
+    return vpack::crypto::mba_add(
+        vpack::crypto::mba_xor(a, b * 0x9E3779B97F4A7C15ULL),
+        0x1337C0DEULL
+    );
 }
 
-vpack::vm::VmProgram build_virtualized_verifier(uint64_t dynamic_seed) {
+// Compile-Time Assembled & Rolling-Encrypted Hybrid VM Verifier
+constexpr auto build_constexpr_verifier() noexcept {
     using namespace vpack::vm;
-    BytecodeBuilder b(dynamic_seed);
+    ConstexprVmBuilder<256> b(0xC0FFEE123456789ULL);
 
     b.anti_debug_check()
+     .entangle_env(R0)
      .mov_reg(R2, R0)
      .mov_imm(R3, 1)
      .mov_imm(R4, 5)
-     .label("loop_start")
-     .xor_reg(R2, R3)
+     .label(0)
+     .rotate_regs(3)
+     .mba_xor(R2, R3)
      .rol_imm(R2, 7)
      .add_imm(R2, 0x5A5A)
      .add_imm(R3, 1)
      .cmp_reg(R3, R4)
-     .jl("loop_start")
-     .jz("loop_start")
+     .jl(0)
+     .jz(0)
      .mov_reg(R0, R2)
+     .state_matrix(0x3C)
      .call_native(1, R0)
      .anti_debug_check()
      .ret();
 
     return b.finalize();
 }
+
+static constexpr auto kCompiledVerifier = build_constexpr_verifier();
 
 } // namespace
 
@@ -69,10 +82,10 @@ int main(int argc, char** argv) {
     }
 
     std::cout << VPACK_STR("============================================================\n");
-    std::cout << VPACK_STR("  VPack Protected Process (Live Memory Guard & VM)\n");
+    std::cout << VPACK_STR("  VPack Protected Process (JIT Execute&Wipe + Hybrid MBA VM)\n");
     std::cout << VPACK_STR("============================================================\n");
 
-    // 1. Initialize Runtime Protection (Anti-Debug + Anti-Dump + PE Header Erase + PEB Size Tamper + Module Snapshot)
+    // 1. Initialize Runtime Protection (Anti-Debug + Anti-Dump + PE Header Erase + JIT .vcode Vault)
     const auto status = vpack::Protector::initialize(vpack::PROT_DEFAULT);
 
     const auto* module_base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
@@ -89,6 +102,7 @@ int main(int argc, char** argv) {
               << VPACK_STR("    - Process ID (PID)       : ") << std::dec << pid << "\n"
               << VPACK_STR("    - Base Address           : 0x") << std::hex << reinterpret_cast<uintptr_t>(module_base) << "\n"
               << VPACK_STR("    - Packed Binary (.vpack) : ") << (status.packed_binary ? VPACK_STR("YES") : VPACK_STR("NO (Unpacked Dev Build)")) << "\n"
+              << VPACK_STR("    - .vcode JIT Vault       : ") << (vpack::antidump::is_vcode_jit_active() ? VPACK_STR("ACTIVE (Encrypted & PAGE_READONLY at Rest)") : VPACK_STR("INACTIVE")) << "\n"
               << VPACK_STR("    - .text Baseline Hash    : 0x") << std::hex << status.text_baseline_hash << "\n"
               << VPACK_STR("    - In-Memory MZ Signature : 0x") << std::hex << mem_mz
               << (mem_mz == 0 ? VPACK_STR(" (WIPED - Anti-Dump Active)\n") : VPACK_STR(" (Present)\n"))
@@ -96,22 +110,23 @@ int main(int argc, char** argv) {
               << (status.initial_debug_report.detected() ? VPACK_STR(" [DETECTED]\n") : VPACK_STR(" [CLEAN]\n"))
               << VPACK_STR("    - RDTSC Timing Delta     : ") << std::dec << status.initial_debug_report.rdtsc_delta << VPACK_STR(" cycles\n\n");
 
-    // 3. Execute function inside ".vcode" section
+    // 3. Execute function inside ".vcode" section via JIT Execute & Wipe Guard
     const uint64_t user_id = 0x1001A5A5ULL;
     const uint64_t salt    = 0x9988776655443322ULL;
-    const uint64_t expected_sig = compute_protected_signature(user_id, salt);
-    std::cout << VPACK_STR("[2] Protected .vcode Section Execution:\n")
-              << VPACK_STR("    - compute_protected_signature() = 0x") << std::hex << expected_sig << std::dec << "\n\n";
+    const uint64_t expected_sig = VPACK_JIT_CALL(compute_protected_signature, user_id, salt);
+    std::cout << VPACK_STR("[2] Protected .vcode Section Execution (JIT Execute & Re-Encrypt):\n")
+              << VPACK_STR("    - compute_protected_signature() = 0x") << std::hex << expected_sig
+              << VPACK_STR(" (JIT Gen #") << std::dec << vpack::antidump::vcode_jit_generation() << VPACK_STR(")\n\n");
 
-    // 4. Execute virtualized function inside the Polymorphic VM Engine
+    // 4. Execute compile-time assembled function inside the Hybrid Polymorphic VM Engine
     vpack::vm::VmEngine vm;
     vm.register_native(1, &native_mix_helper);
 
-    vpack::vm::VmProgram prog = build_virtualized_verifier(0xC0FFEE123456789ULL);
+    vpack::vm::VmProgram prog = kCompiledVerifier.to_program();
     bool vm_ok = false;
     uint64_t expected_vm = vm.run_WithArgs(prog, 0xABCDEF0123456789ULL, user_id, 0, 0, &vm_ok);
 
-    std::cout << VPACK_STR("[3] Polymorphic Virtual Machine Execution:\n")
+    std::cout << VPACK_STR("[3] Hybrid Polymorphic Virtual Machine Execution:\n")
               << VPACK_STR("    - Encrypted Bytecode Size : ") << prog.bytecode.size() << VPACK_STR(" bytes\n")
               << VPACK_STR("    - VM Execution Status     : ") << (vm_ok ? VPACK_STR("SUCCESS") : VPACK_STR("FAILED")) << "\n"
               << VPACK_STR("    - VM Computed Digest      : 0x") << std::hex << expected_vm << std::dec << "\n";
@@ -121,7 +136,7 @@ int main(int argc, char** argv) {
     bool tampered_ok = true;
     vm.run_WithArgs(tampered_prog, 0xABCDEF0123456789ULL, user_id, 0, 0, &tampered_ok);
     std::cout << VPACK_STR("    - Bytecode Tamper Test    : ")
-              << (!tampered_ok ? VPACK_STR("BLOCKED (Integrity Tag Mismatch)") : VPACK_STR("UNEXPECTED")) << "\n\n";
+              << (!tampered_ok ? VPACK_STR("BLOCKED (Ciphertext MAC Mismatch)") : VPACK_STR("UNEXPECTED")) << "\n\n";
 
     if (!persistent_mode) {
         vpack::antidebug::DebugReport live_report{};
@@ -141,11 +156,9 @@ int main(int argc, char** argv) {
 
         vpack::antidebug::DebugReport rep{};
         bool env_clean = vpack::Protector::verify_environment(&rep);
-        bool fn_bp = vpack::antidebug::scan_software_breakpoints(
-            reinterpret_cast<const void*>(&compute_protected_signature), 16
-        );
+        bool vcode_intact = vpack::antidump::verify_vcode_integrity();
 
-        uint64_t cur_sig = compute_protected_signature(user_id, salt);
+        uint64_t cur_sig = VPACK_JIT_CALL(compute_protected_signature, user_id, salt);
         bool cur_vm_ok = false;
         uint64_t cur_vm = vm.run_WithArgs(prog, 0xABCDEF0123456789ULL, user_id, 0, 0, &cur_vm_ok);
         uint16_t cur_mz = *reinterpret_cast<const uint16_t*>(module_base);
@@ -153,7 +166,8 @@ int main(int argc, char** argv) {
         std::cout << VPACK_STR("  [Tick #") << std::dec << std::setw(2) << tick << VPACK_STR("] ")
                   << VPACK_STR("MZ:0x") << std::hex << cur_mz << " | "
                   << VPACK_STR(".text:") << (env_clean ? VPACK_STR("OK") : VPACK_STR("ALERT")) << " | "
-                  << VPACK_STR(".vcode:") << ((!fn_bp && cur_sig == expected_sig) ? VPACK_STR("OK") : VPACK_STR("TAMPERED")) << " | "
+                  << VPACK_STR(".vcode:") << ((vcode_intact && cur_sig == expected_sig) ? VPACK_STR("JIT_OK") : VPACK_STR("TAMPERED"))
+                  << VPACK_STR("(G#") << std::dec << vpack::antidump::vcode_jit_generation() << ") | "
                   << VPACK_STR("VM:") << ((cur_vm_ok && cur_vm == expected_vm) ? VPACK_STR("OK") : VPACK_STR("TAMPERED"));
 
         if (rep.flags & vpack::antidebug::THREAT_DLL_INJECTED) {

@@ -19,7 +19,10 @@ enum ThreatFlag : uint32_t {
     THREAT_TIMING_ANOMALY       = 1u << 6,
     THREAT_SOFTWARE_BREAKPOINT  = 1u << 7,
     THREAT_KERNEL_DEBUGGER      = 1u << 8,
-    THREAT_DLL_INJECTED         = 1u << 9
+    THREAT_DLL_INJECTED         = 1u << 9,
+    THREAT_NTDLL_HOOKED         = 1u << 10,
+    THREAT_KUSER_DEBUGGER       = 1u << 11,
+    THREAT_VCODE_TAMPERED       = 1u << 12
 };
 
 struct DebugReport {
@@ -36,9 +39,14 @@ bool check_peb_being_debugged() noexcept;
 bool check_nt_global_flag() noexcept;
 uint32_t check_nt_query_debug() noexcept;
 bool check_kernel_debugger() noexcept;
+bool check_kuser_shared_data() noexcept;
 bool check_and_clear_hardware_breakpoints(bool clear_if_found, uint32_t* out_count = nullptr) noexcept;
 bool check_timing_anomaly(uint64_t threshold_cycles = 250000ULL, uint64_t* out_delta = nullptr) noexcept;
 bool scan_software_breakpoints(const void* address, size_t size) noexcept;
+
+// Returns 0ULL if environment is completely clean, or a non-zero cryptographic
+// perturbation value if any debugger, hook, or hardware breakpoint is active.
+uint64_t compute_environmental_key_poison() noexcept;
 
 bool hide_current_thread() noexcept;
 

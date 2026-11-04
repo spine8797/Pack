@@ -34,9 +34,11 @@ enum ProtectionFlags : uint32_t {
     PROT_VERIFY_INTEGRITY   = 1u << 4,
     PROT_TAMPER_IMAGE_SIZE  = 1u << 5,
     PROT_STUB_ANTI_DEBUG    = 1u << 6,
+    PROT_DIRECT_SYSCALL     = 1u << 7,
+    PROT_JIT_VCODE          = 1u << 8,
     PROT_DEFAULT            = PROT_ANTI_DEBUG | PROT_ANTI_DUMP | PROT_HIDE_THREAD |
                               PROT_CLEAR_HWBP | PROT_VERIFY_INTEGRITY | PROT_TAMPER_IMAGE_SIZE |
-                              PROT_STUB_ANTI_DEBUG
+                              PROT_STUB_ANTI_DEBUG | PROT_DIRECT_SYSCALL | PROT_JIT_VCODE
 };
 
 #pragma pack(push, 1)
@@ -59,10 +61,15 @@ struct VPackHeader {
     uint32_t    code_reloc_count;       // 0x24
     uint32_t    orig_pdata_rva;         // 0x28
     uint32_t    orig_pdata_size;        // 0x2C
-    VPackRegion regions[VPACK_MAX_REGIONS];               // 0x30
-    uint32_t    code_reloc_rvas[VPACK_MAX_CODE_RELOCS];   // 0xF0
+    VPackRegion regions[VPACK_MAX_REGIONS];               // 0x30 .. 0x270
+    uint32_t    code_reloc_rvas[VPACK_MAX_CODE_RELOCS];   // 0x270 .. 0x8F0
     uint32_t    orig_import_rva;                          // 0x8F0
+    uint32_t    vcode_rva;                                // 0x8F4 (masked with low32(master_seed))
+    uint32_t    vcode_size;                               // 0x8F8 (masked with high32(master_seed))
+    uint32_t    vcode_jit_tag;                            // 0x8FC
 };
 #pragma pack(pop)
+
+static_assert(sizeof(VPackHeader) == 0x900, "VPackHeader must be exactly 0x900 bytes");
 
 } // namespace vpack

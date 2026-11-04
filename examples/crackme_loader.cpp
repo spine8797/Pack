@@ -13,9 +13,9 @@
 namespace {
 
 // ============================================================================
-// COMPILE-TIME ONLY: Pre-encrypts the secret payload using the exact 8-round
-// VM Feistel key schedule so NEITHER the master key NOR the plaintext payload
-// ever exists in the compiled binary!
+// COMPILE-TIME ONLY: Pre-encrypts the secret payload AND compiles the Hybrid
+// VM Bytecode at C++ compile-time so NEITHER the master key, NOR the plaintext
+// payload, NOR any BytecodeBuilder function calls ever exist in the binary!
 // ============================================================================
 constexpr uint64_t compile_time_k1(const char* str, size_t len) noexcept {
     uint64_t k1 = 0x5341424C455F3236ULL;
@@ -26,24 +26,32 @@ constexpr uint64_t compile_time_k1(const char* str, size_t len) noexcept {
     return k1;
 }
 
+// Exact mathematical mirror of the Hybrid VM (Non-Linear MBA + GF(2^64) +
+// State-Matrix Automaton + Dynamic Register Rotation + Encrypted Stack)
 constexpr uint64_t compile_time_vm_schedule(uint64_t r0, uint64_t r1) noexcept {
     for (uint64_t r4 = 1; r4 <= 8; ++r4) {
-        r0 ^= r1;
+        r0 = vpack::crypto::mba_xor(r0, r1);
         r0 = (r0 << 13) | (r0 >> 51);
-        r0 += 0x9E3779B97F4A7C15ULL;
-        r1 ^= r0;
+        r0 = vpack::crypto::mba_add(r0, 0x9E3779B97F4A7C15ULL);
+        r1 = vpack::crypto::mba_xor(r1, r0);
         r1 = (r1 >> 17) | (r1 << 47);
         r0 *= r4;
+
+        // Hybrid State-Matrix transformation (mkey = 0x5A)
+        const uint64_t k  = static_cast<uint64_t>(0x5Au) * 0x9E3779B97F4A7C15ULL;
+        const uint64_t f0 = vpack::crypto::gf2_64_mul(r1 ^ k, 0xBF58476D1CE4E5B9ULL | 1ULL);
+        const uint64_t n0 = vpack::crypto::mba_xor(r0, vpack::crypto::mba_add(f0, r1 * 0x94D049BB133111EBULL));
+        const uint64_t f1 = vpack::crypto::poly_permute_64(n0, k ^ 0x5341424C45ULL);
+        const uint64_t n1 = vpack::crypto::mba_xor(r1, f1);
+        r0 = n0;
+        r1 = n1;
     }
-    r0 ^= r1;
+    r0 = vpack::crypto::mba_xor(r0, r1);
     return r0;
 }
 
 constexpr uint8_t payload_stream_byte(uint64_t derived_key, size_t i) noexcept {
-    uint64_t z = derived_key + static_cast<uint64_t>(i) * 0x9E3779B97F4A7C15ULL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    return static_cast<uint8_t>((z ^ (z >> 31)) & 0xFFu);
+    return vpack::crypto::poly_stream_byte(derived_key, i);
 }
 
 template <size_t N>
@@ -70,72 +78,80 @@ static constexpr CompileTimeVault kVault(
     "FLAG{SABLE_VM_UNPATCHABLE_2026} :: VIP Loader Stage Unlocked & Active!"
 );
 
-// Builds the 8-round Polymorphic VM Key-Derivation Program at runtime.
-// Inputs:
-//   R0 = k0 (FNV-1a 64-bit of user input)
-//   R1 = k1 (Rolling mix of user input)
-//   R2 = integrity_delta (.text live hash ^ baseline hash -> 0 if unpatched/no INT3)
-//   R3 = threat_flags (anti-debug & anti-injection report flags -> 0 if clean)
-VPACK_CODE vpack::vm::VmProgram build_key_schedule_vm(uint64_t vm_seed) {
+// ============================================================================
+// COMPILE-TIME ASSEMBLED & ROLLING-ENCRYPTED HYBRID VM PROGRAM
+// No runtime BytecodeBuilder calls exist anywhere in the binary!
+// ============================================================================
+constexpr auto build_constexpr_key_vm() noexcept {
     using namespace vpack::vm;
-    BytecodeBuilder b(vm_seed);
+    ConstexprVmBuilder<256> b(0x4A414E55535F3236ULL);
 
     b.anti_debug_check()
-     .xor_reg(R0, R2)                        // Poison R0 if .text was patched or breakpointed
-     .sub_reg(R1, R3)                        // Poison R1 if debugger/injected DLL detected
+     .entangle_env(R0)                       // Silent environmental key poison (PEB + KUSER + Syscall DebugPort)
+     .mba_xor(R0, R2)                        // Poison R0 if .text or .vcode was patched/breakpointed
+     .mba_sub(R1, R3)                        // Poison R1 if debugger/injected DLL/hook detected
      .mov_imm(R4, 1)                         // R4 = round = 1
      .mov_imm(R5, 8)                         // R5 = max_rounds = 8
 
-     .label("feistel_loop")
-     .xor_reg(R0, R1)
+     .label(0)                               // OP_SYNC_STATE + feistel_loop target
+     .rotate_regs(3)                         // Rotate physical-virtual register mapping dynamically
+     .mba_xor(R0, R1)
      .rol_imm(R0, 13)
      .add_imm(R0, 0x9E3779B97F4A7C15ULL)
-     .xor_reg(R1, R0)
+     .mba_xor(R1, R0)
      .ror_imm(R1, 17)
      .imul_reg(R0, R4)
+     .push(R0)                               // Bipartite encrypted stack round-trip
+     .pop(R0)
+     .state_matrix(0x5A)                     // GF(2^64) x Z_{2^64} 2x2 State-Matrix Automaton
      .add_imm(R4, 1)
      .cmp_reg(R4, R5)
-     .jl("feistel_loop")
-     .jz("feistel_loop")
+     .jl(0)
+     .jz(0)
 
-     .xor_reg(R0, R1)
-     .xor_reg(R0, R2)
-     .xor_reg(R0, R3)
+     .mba_xor(R0, R1)
+     .mba_xor(R0, R2)
+     .mba_xor(R0, R3)
+     .entangle_env(R0)
      .anti_debug_check()
      .ret();
 
     return b.finalize();
 }
 
+static constexpr auto kCompiledKeyVm = build_constexpr_key_vm();
+
 } // namespace
 
-// Placed in encrypted .vcode (.sbl1) section: derives the 64-bit decryption key via Polymorphic VM
-// and attempts to decrypt & verify the secret Loader Vault.
+// Placed in JIT-encrypted .vcode (.sbl1) section: remains encrypted & PAGE_READONLY
+// in RAM at rest, decrypted only inside VPACK_JIT_CALL and re-encrypted with a new
+// rolling key immediately on return!
 VPACK_CODE bool try_unlock_loader_vault(
     const std::string& user_key,
     uint64_t baseline_text_hash,
     std::string& out_decrypted_payload,
     uint64_t& out_derived_key
 ) {
-    // 1. Live environment, anti-debug, anti-injection & code integrity verification
+    // 1. Live environment, anti-debug (Indirect Syscall), anti-injection & code integrity verification
     vpack::antidebug::DebugReport rep{};
     vpack::Protector::verify_environment(&rep);
 
     const uint64_t live_text_hash  = vpack::antidump::compute_text_integrity(nullptr);
-    const uint64_t integrity_delta = live_text_hash ^ baseline_text_hash;
-    const uint64_t threat_flags    = static_cast<uint64_t>(rep.flags);
+    const uint64_t integrity_delta = vpack::crypto::mba_xor(live_text_hash, baseline_text_hash);
+    const uint64_t threat_flags    = static_cast<uint64_t>(rep.flags) ^
+                                     vpack::antidebug::compute_environmental_key_poison();
 
-    // 2. Compute input key material (k0, k1)
+    // 2. Compute input key material (k0, k1) with Non-Linear MBA
     const uint64_t k0 = vpack::crypto::fnv1a_64(user_key.data(), user_key.size());
     uint64_t k1 = 0x5341424C455F3236ULL;
     for (size_t i = 0; i < user_key.size(); ++i) {
-        k1 = ((k1 << 7) | (k1 >> 57)) ^
-             (static_cast<uint64_t>(static_cast<uint8_t>(user_key[i])) * 0x9E3779B97F4A7C15ULL);
+        uint64_t rot = (k1 << 7) | (k1 >> 57);
+        uint64_t term = static_cast<uint64_t>(static_cast<uint8_t>(user_key[i])) * 0x9E3779B97F4A7C15ULL;
+        k1 = vpack::crypto::mba_xor(rot, term);
     }
 
-    // 3. Execute 8-round Feistel key derivation inside the Direct-Threaded Polymorphic VM
-    const uint64_t dynamic_vm_seed = (__rdtsc() ^ 0x5341424C455F4B59ULL) | 1ULL;
-    vpack::vm::VmProgram vm_prog = build_key_schedule_vm(dynamic_vm_seed);
+    // 3. Execute pre-compiled Hybrid VM program (Instruction-Chained Rolling Key + State Matrix)
+    vpack::vm::VmProgram vm_prog = kCompiledKeyVm.to_program();
     vpack::vm::VmEngine  vm_engine;
 
     bool vm_ok = false;
@@ -143,11 +159,11 @@ VPACK_CODE bool try_unlock_loader_vault(
         vm_prog, k0, k1, integrity_delta, threat_flags, &vm_ok
     );
     out_derived_key = derived_key;
-    if (!vm_ok) {
+    if (!vm_ok || vpack::crypto::opaque_false(derived_key)) {
         return false;
     }
 
-    // 4. Decrypt the vault payload using the VM-derived 64-bit key
+    // 4. Decrypt the vault payload using the VM-derived 64-bit GF(2^64)/MBA polynomial stream
     constexpr size_t kLen = kVault.ciphertext.size();
     out_decrypted_payload.resize(kLen);
     for (size_t i = 0; i < kLen; ++i) {
@@ -157,8 +173,6 @@ VPACK_CODE bool try_unlock_loader_vault(
     }
 
     // 5. Verify decrypted payload integrity hash
-    // Note: Patching this check in a debugger only prints garbage ciphertext because
-    // the payload bytes themselves are encrypted with `derived_key`!
     const uint64_t dec_hash = vpack::crypto::fnv1a_64(
         out_decrypted_payload.data(), out_decrypted_payload.size()
     );
@@ -166,10 +180,10 @@ VPACK_CODE bool try_unlock_loader_vault(
 }
 
 int main() {
-    // 1. Initialize full VPack protection (wipes MZ/PE headers, wipes .vpack, enforces RX/R, hides thread)
+    // 1. Initialize full VPack protection (wipes MZ/PE headers, wipes .vpack, locks .vcode in JIT vault)
     const auto prot = vpack::Protector::initialize(vpack::PROT_DEFAULT);
 
-    // 2. Start background anti-debug & anti-injection watchdog thread (hidden via NtCreateThreadEx)
+    // 2. Start background anti-debug & anti-injection watchdog thread (hidden via Indirect Syscall)
     vpack::antidebug::Watchdog watchdog;
     watchdog.start(150, [](const vpack::antidebug::DebugReport&) {});
 
@@ -186,8 +200,8 @@ int main() {
     std::printf("%s%lu\n", VPACK_STR("  [*] Process ID         : ").c_str(), static_cast<unsigned long>(hidden_get_pid()));
     std::printf("%s0x%llx\n", VPACK_STR("  [*] Base Address       : ").c_str(),
                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(module_base)));
-    std::printf("%s", VPACK_STR("  [*] Protection Profile : 2-Stage Packed + Zero-RWX + Threaded VM\n").c_str());
-    std::printf("%s", VPACK_STR("  [*] Anti-Dump Status   : PE Headers & .vpack Erased in RAM\n").c_str());
+    std::printf("%s", VPACK_STR("  [*] Protection Profile : JIT Execute&Wipe + Hybrid MBA VM + Indirect Syscall\n").c_str());
+    std::printf("%s", VPACK_STR("  [*] Anti-Dump Status   : PE Headers Wiped & .vcode Encrypted at Rest in RAM\n").c_str());
     std::printf("%s", VPACK_STR("------------------------------------------------------------\n").c_str());
 
     int attempts = 0;
@@ -204,6 +218,8 @@ int main() {
             break;
         }
         std::string input_key(line_buf);
+        vpack::crypto::secure_wipe(line_buf, sizeof(line_buf), attempts);
+
         while (!input_key.empty() && (input_key.back() == '\r' || input_key.back() == '\n' || input_key.back() == ' ')) {
             input_key.pop_back();
         }
@@ -212,17 +228,30 @@ int main() {
         }
 
         uint64_t derived_key = 0;
-        if (try_unlock_loader_vault(input_key, prot.text_baseline_hash, unlocked_payload, derived_key)) {
+        // Invoke .vcode function via JIT Execute & Wipe Guard (decrypts -> runs -> re-encrypts with new key)
+        bool ok = VPACK_JIT_CALL(
+            try_unlock_loader_vault,
+            input_key,
+            prot.text_baseline_hash,
+            unlocked_payload,
+            derived_key
+        );
+        vpack::crypto::secure_wipe(&input_key[0], input_key.size(), derived_key);
+
+        if (ok) {
             unlocked     = true;
             unlocked_key = derived_key;
             break;
         } else {
+            vpack::crypto::secure_wipe(&unlocked_payload[0], unlocked_payload.size(), derived_key);
+            unlocked_payload.clear();
             ++attempts;
-            std::printf("%s%d%s0x%016llx)\n",
+            std::printf("%s%d%s0x%016llx | JIT Gen #%llu)\n",
                         VPACK_STR("  [-] Access Denied! Invalid License Key (Attempt ").c_str(),
                         attempts,
                         VPACK_STR("/5 | VM Digest: ").c_str(),
-                        static_cast<unsigned long long>(derived_key));
+                        static_cast<unsigned long long>(derived_key),
+                        static_cast<unsigned long long>(vpack::antidump::vcode_jit_generation()));
         }
     }
 
@@ -237,7 +266,13 @@ int main() {
     std::printf("%s0x%016llx\n", VPACK_STR("  [+] VM Derived Key    : ").c_str(),
                 static_cast<unsigned long long>(unlocked_key));
     std::printf("%s%s\n", VPACK_STR("  [+] Decrypted Payload : ").c_str(), unlocked_payload.c_str());
+    std::printf("%s%llu\n", VPACK_STR("  [+] .vcode JIT Re-Key : Generation #").c_str(),
+                static_cast<unsigned long long>(vpack::antidump::vcode_jit_generation()));
     std::printf("%s", VPACK_STR("============================================================\n").c_str());
+
+    // Immediately wipe the unlocked plaintext payload from RAM after displaying it!
+    vpack::crypto::secure_wipe(&unlocked_payload[0], unlocked_payload.size(), unlocked_key);
+    unlocked_payload.clear();
 
     while (true) {
         std::printf("%s", VPACK_STR("\n  --- [ Protected Loader Menu ] ---\n").c_str());
@@ -266,8 +301,11 @@ int main() {
                         static_cast<unsigned>(mz),
                         (mz == 0 ? VPACK_STR(" (WIPED)\n").c_str() : VPACK_STR(" (Present)\n").c_str()));
             std::printf("%s%s",
-                        VPACK_STR("      - .text Integrity     : ").c_str(),
-                        (clean ? VPACK_STR("VERIFIED CLEAN\n").c_str() : VPACK_STR("TAMPER / ALERT\n").c_str()));
+                        VPACK_STR("      - .text & .vcode Hash : ").c_str(),
+                        (clean ? VPACK_STR("VERIFIED CLEAN (Encrypted at Rest)\n").c_str() : VPACK_STR("TAMPER / ALERT\n").c_str()));
+            std::printf("%s#%llu\n",
+                        VPACK_STR("      - .vcode JIT Gen      : ").c_str(),
+                        static_cast<unsigned long long>(vpack::antidump::vcode_jit_generation()));
             std::printf("%s0x%x\n", VPACK_STR("      - Threat Flags        : ").c_str(), rep.flags);
             if (rep.flags & vpack::antidebug::THREAT_DLL_INJECTED) {
                 std::printf("%s%s @ 0x%llx\n",

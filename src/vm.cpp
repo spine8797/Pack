@@ -1,6 +1,7 @@
 #include "vpack/vm.h"
 #include "vpack/crypto.h"
 #include "vpack/anti_debug.h"
+#include "vpack/anti_dump.h"
 #include <intrin.h>
 #include <cstring>
 #include <cstdlib>
@@ -9,15 +10,9 @@ namespace vpack::vm {
 
 namespace {
 
-VPACK_FORCEINLINE uint64_t splitmix64(uint64_t& state) noexcept {
-    uint64_t z = (state += 0x9E3779B97F4A7C15ULL);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    return z ^ (z >> 31);
-}
-
 // Position-independent ephemeral stream byte so random-access jumps (JMP/JZ/JNZ)
-// decrypt single bytes in registers without ever holding plaintext bytecode in RAM.
+// strip the per-run RDTSC layer in registers while the instruction-chained rolling
+// key decrypts 1 byte at a time without ever holding plaintext bytecode in RAM.
 VPACK_FORCEINLINE uint8_t ephemeral_stream_byte(uint64_t key, size_t idx) noexcept {
     uint64_t x = key ^ (static_cast<uint64_t>(idx) * 0x9E3779B97F4A7C15ULL);
     x ^= (x >> 30);
@@ -27,7 +22,7 @@ VPACK_FORCEINLINE uint8_t ephemeral_stream_byte(uint64_t key, size_t idx) noexce
 }
 
 VPACK_FORCEINLINE void update_cmp_flags(VmContext& ctx, uint64_t lhs, uint64_t rhs) noexcept {
-    uint64_t res = lhs - rhs;
+    uint64_t res = crypto::mba_sub(lhs, rhs);
     ctx.flags &= ~(FLAG_ZF | FLAG_SF | FLAG_CF | FLAG_OF);
     if (res == 0) {
         ctx.flags |= FLAG_ZF;
@@ -57,20 +52,39 @@ constexpr uintptr_t kHandlerPtrMask = static_cast<uintptr_t>(0xD6E8FEB86659FD93U
 struct VmExecState;
 using VmHandlerFn = bool(*)(VmExecState&) noexcept;
 
+VPACK_FORCEINLINE uintptr_t encode_handler_slot(VmHandlerFn fn, uintptr_t mask, size_t idx) noexcept {
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(reinterpret_cast<void*>(fn));
+    const uintptr_t salt = static_cast<uintptr_t>(crypto::poly_permute_64(idx, mask));
+    return static_cast<uintptr_t>(crypto::mba_xor(addr, crypto::mba_add(mask, salt)));
+}
+
+VPACK_FORCEINLINE VmHandlerFn decode_handler_slot(uintptr_t encoded, uintptr_t mask, size_t idx) noexcept {
+    const uintptr_t salt = static_cast<uintptr_t>(crypto::poly_permute_64(idx, mask));
+    const uintptr_t raw  = static_cast<uintptr_t>(crypto::mba_xor(encoded, crypto::mba_add(mask, salt)));
+    return reinterpret_cast<VmHandlerFn>(reinterpret_cast<void*>(raw));
+}
+
 struct VmExecState {
     VmContext&                                          ctx;
     std::vector<uint8_t>&                               code;
     size_t                                              code_size;
+    uint64_t                                            seed;
     uint64_t                                            ephemeral_key;
     uintptr_t                                           runtime_ptr_mask;
     const PolymorphicOpcodeTable&                       op_table;
     const std::array<uintptr_t, OP_MAX_COUNT>&          encrypted_handlers;
     const std::unordered_map<uint16_t, NativeCallback>& native_table;
 
+    // Reads 1 byte by stripping the ephemeral RDTSC layer AND stepping the
+    // instruction-chained rolling state in CPU registers (never in RAM).
     VPACK_FORCEINLINE bool read_u8(uint8_t& out) noexcept {
         if (ctx.ip >= code_size) return false;
-        const size_t idx = ctx.ip++;
-        out = static_cast<uint8_t>(code[idx] ^ ephemeral_stream_byte(ephemeral_key, idx));
+        const size_t idx    = ctx.ip++;
+        const uint8_t cbyte = static_cast<uint8_t>(code[idx] ^ ephemeral_stream_byte(ephemeral_key, idx));
+        const uint8_t kbyte = rolling_stream_byte(ctx.rolling_state, idx, seed);
+        const uint8_t plain = static_cast<uint8_t>(cbyte ^ kbyte);
+        ctx.rolling_state   = step_rolling_state(ctx.rolling_state, plain, idx, seed);
+        out                 = plain;
         return true;
     }
 
@@ -102,7 +116,7 @@ struct VmExecState {
     }
 };
 
-// Direct Threaded Dispatch: each handler chains directly to the next handler (no central loop!)
+// Direct Threaded + Entangled MBA Dispatch: each handler chains directly to the next handler
 VPACK_CODE bool dispatch_next(VmExecState& s) noexcept {
     if (s.ctx.halted || s.ctx.ip >= s.code_size) {
         return s.ctx.halted && !s.ctx.tampered;
@@ -114,15 +128,17 @@ VPACK_CODE bool dispatch_next(VmExecState& s) noexcept {
     }
 
     const uint8_t logical_op = s.op_table.physical_to_logical[phys_op];
-    if (logical_op >= OP_MAX_COUNT) {
+    if (logical_op >= OP_MAX_COUNT || crypto::opaque_false(s.ctx.rolling_state ^ phys_op)) {
         s.ctx.tampered = true;
         s.ctx.halted = true;
         return false;
     }
 
-    const uintptr_t raw_fn = s.encrypted_handlers[logical_op] ^ s.runtime_ptr_mask ^
-                             (static_cast<uintptr_t>(logical_op) * 0x9E3779B9u);
-    const auto next_handler = reinterpret_cast<VmHandlerFn>(reinterpret_cast<void*>(raw_fn));
+    const auto next_handler = decode_handler_slot(
+        s.encrypted_handlers[logical_op],
+        s.runtime_ptr_mask,
+        logical_op
+    );
     return next_handler(s);
 }
 
@@ -133,102 +149,102 @@ VPACK_CODE bool h_nop(VmExecState& s) noexcept {
 VPACK_CODE bool h_mov_imm(VmExecState& s) noexcept {
     uint8_t dst = 0; uint64_t imm = 0;
     if (!s.read_u8(dst) || !s.read_u64(imm) || dst >= REG_COUNT) return false;
-    s.ctx.regs[dst] = imm;
+    s.ctx.vreg(dst) = imm;
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_mov_reg(VmExecState& s) noexcept {
     uint8_t dst = 0, src = 0;
     if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
-    s.ctx.regs[dst] = s.ctx.regs[src];
+    s.ctx.vreg(dst) = s.ctx.vreg(src);
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_add_reg(VmExecState& s) noexcept {
     uint8_t dst = 0, src = 0;
     if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
-    s.ctx.regs[dst] += s.ctx.regs[src];
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) = crypto::mba_add(s.ctx.vreg(dst), s.ctx.vreg(src));
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_add_imm(VmExecState& s) noexcept {
     uint8_t dst = 0; uint64_t imm = 0;
     if (!s.read_u8(dst) || !s.read_u64(imm) || dst >= REG_COUNT) return false;
-    s.ctx.regs[dst] += imm;
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) = crypto::mba_add(s.ctx.vreg(dst), imm);
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_sub_reg(VmExecState& s) noexcept {
     uint8_t dst = 0, src = 0;
     if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
-    s.ctx.regs[dst] -= s.ctx.regs[src];
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) = crypto::mba_sub(s.ctx.vreg(dst), s.ctx.vreg(src));
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_sub_imm(VmExecState& s) noexcept {
     uint8_t dst = 0; uint64_t imm = 0;
     if (!s.read_u8(dst) || !s.read_u64(imm) || dst >= REG_COUNT) return false;
-    s.ctx.regs[dst] -= imm;
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) = crypto::mba_sub(s.ctx.vreg(dst), imm);
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_imul_reg(VmExecState& s) noexcept {
     uint8_t dst = 0, src = 0;
     if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
-    s.ctx.regs[dst] *= s.ctx.regs[src];
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) *= s.ctx.vreg(src);
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_xor_reg(VmExecState& s) noexcept {
     uint8_t dst = 0, src = 0;
     if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
-    s.ctx.regs[dst] ^= s.ctx.regs[src];
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) = crypto::mba_xor(s.ctx.vreg(dst), s.ctx.vreg(src));
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_xor_imm(VmExecState& s) noexcept {
     uint8_t dst = 0; uint64_t imm = 0;
     if (!s.read_u8(dst) || !s.read_u64(imm) || dst >= REG_COUNT) return false;
-    s.ctx.regs[dst] ^= imm;
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) = crypto::mba_xor(s.ctx.vreg(dst), imm);
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_and_reg(VmExecState& s) noexcept {
     uint8_t dst = 0, src = 0;
     if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
-    s.ctx.regs[dst] &= s.ctx.regs[src];
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) &= s.ctx.vreg(src);
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_or_reg(VmExecState& s) noexcept {
     uint8_t dst = 0, src = 0;
     if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
-    s.ctx.regs[dst] |= s.ctx.regs[src];
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) |= s.ctx.vreg(src);
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_shl_imm(VmExecState& s) noexcept {
     uint8_t dst = 0, shift = 0;
     if (!s.read_u8(dst) || !s.read_u8(shift) || dst >= REG_COUNT) return false;
-    s.ctx.regs[dst] <<= (shift & 63);
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) <<= (shift & 63);
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_shr_imm(VmExecState& s) noexcept {
     uint8_t dst = 0, shift = 0;
     if (!s.read_u8(dst) || !s.read_u8(shift) || dst >= REG_COUNT) return false;
-    s.ctx.regs[dst] >>= (shift & 63);
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) >>= (shift & 63);
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
@@ -236,8 +252,8 @@ VPACK_CODE bool h_rol_imm(VmExecState& s) noexcept {
     uint8_t dst = 0, shift = 0;
     if (!s.read_u8(dst) || !s.read_u8(shift) || dst >= REG_COUNT) return false;
     uint8_t sh = shift & 63;
-    if (sh != 0) s.ctx.regs[dst] = (s.ctx.regs[dst] << sh) | (s.ctx.regs[dst] >> (64 - sh));
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    if (sh != 0) s.ctx.vreg(dst) = (s.ctx.vreg(dst) << sh) | (s.ctx.vreg(dst) >> (64 - sh));
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
@@ -245,59 +261,66 @@ VPACK_CODE bool h_ror_imm(VmExecState& s) noexcept {
     uint8_t dst = 0, shift = 0;
     if (!s.read_u8(dst) || !s.read_u8(shift) || dst >= REG_COUNT) return false;
     uint8_t sh = shift & 63;
-    if (sh != 0) s.ctx.regs[dst] = (s.ctx.regs[dst] >> sh) | (s.ctx.regs[dst] << (64 - sh));
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    if (sh != 0) s.ctx.vreg(dst) = (s.ctx.vreg(dst) >> sh) | (s.ctx.vreg(dst) << (64 - sh));
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_not_reg(VmExecState& s) noexcept {
     uint8_t dst = 0;
     if (!s.read_u8(dst) || dst >= REG_COUNT) return false;
-    s.ctx.regs[dst] = ~s.ctx.regs[dst];
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) = ~s.ctx.vreg(dst);
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_neg_reg(VmExecState& s) noexcept {
     uint8_t dst = 0;
     if (!s.read_u8(dst) || dst >= REG_COUNT) return false;
-    s.ctx.regs[dst] = static_cast<uint64_t>(-static_cast<int64_t>(s.ctx.regs[dst]));
-    update_alu_flags(s.ctx, s.ctx.regs[dst]);
+    s.ctx.vreg(dst) = static_cast<uint64_t>(-static_cast<int64_t>(s.ctx.vreg(dst)));
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_cmp_reg(VmExecState& s) noexcept {
     uint8_t lhs = 0, rhs = 0;
     if (!s.read_u8(lhs) || !s.read_u8(rhs) || lhs >= REG_COUNT || rhs >= REG_COUNT) return false;
-    update_cmp_flags(s.ctx, s.ctx.regs[lhs], s.ctx.regs[rhs]);
+    update_cmp_flags(s.ctx, s.ctx.vreg(lhs), s.ctx.vreg(rhs));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_cmp_imm(VmExecState& s) noexcept {
     uint8_t lhs = 0; uint64_t imm = 0;
     if (!s.read_u8(lhs) || !s.read_u64(imm) || lhs >= REG_COUNT) return false;
-    update_cmp_flags(s.ctx, s.ctx.regs[lhs], imm);
+    update_cmp_flags(s.ctx, s.ctx.vreg(lhs), imm);
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_jmp(VmExecState& s) noexcept {
     uint32_t target = 0;
     if (!s.read_u32(target) || target >= s.code_size) return false;
-    s.ctx.ip = target;
+    s.ctx.ip            = target;
+    s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_jz(VmExecState& s) noexcept {
     uint32_t target = 0;
     if (!s.read_u32(target) || target >= s.code_size) return false;
-    if (s.ctx.flags & FLAG_ZF) s.ctx.ip = target;
+    if (s.ctx.flags & FLAG_ZF) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_jnz(VmExecState& s) noexcept {
     uint32_t target = 0;
     if (!s.read_u32(target) || target >= s.code_size) return false;
-    if (!(s.ctx.flags & FLAG_ZF)) s.ctx.ip = target;
+    if (!(s.ctx.flags & FLAG_ZF)) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
     return dispatch_next(s);
 }
 
@@ -307,7 +330,10 @@ VPACK_CODE bool h_jg(VmExecState& s) noexcept {
     bool zf = (s.ctx.flags & FLAG_ZF) != 0;
     bool sf = (s.ctx.flags & FLAG_SF) != 0;
     bool of = (s.ctx.flags & FLAG_OF) != 0;
-    if (!zf && (sf == of)) s.ctx.ip = target;
+    if (!zf && (sf == of)) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
     return dispatch_next(s);
 }
 
@@ -316,21 +342,29 @@ VPACK_CODE bool h_jl(VmExecState& s) noexcept {
     if (!s.read_u32(target) || target >= s.code_size) return false;
     bool sf = (s.ctx.flags & FLAG_SF) != 0;
     bool of = (s.ctx.flags & FLAG_OF) != 0;
-    if (sf != of) s.ctx.ip = target;
+    if (sf != of) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
     return dispatch_next(s);
 }
 
+// Bipartite Encrypted Stack Push: stack values are never plaintext in RAM
 VPACK_CODE bool h_push_reg(VmExecState& s) noexcept {
     uint8_t src = 0;
     if (!s.read_u8(src) || src >= REG_COUNT) return false;
-    s.ctx.stack.push_back(s.ctx.regs[src]);
+    const size_t sp     = s.ctx.stack.size();
+    const uint64_t mask = crypto::poly_permute_64(s.ctx.stack_key, sp);
+    s.ctx.stack.push_back(crypto::mba_xor(s.ctx.vreg(src), mask));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_pop_reg(VmExecState& s) noexcept {
     uint8_t dst = 0;
     if (!s.read_u8(dst) || dst >= REG_COUNT || s.ctx.stack.empty()) return false;
-    s.ctx.regs[dst] = s.ctx.stack.back();
+    const size_t sp     = s.ctx.stack.size() - 1;
+    const uint64_t mask = crypto::poly_permute_64(s.ctx.stack_key, sp);
+    s.ctx.vreg(dst)     = crypto::mba_xor(s.ctx.stack.back(), mask);
     s.ctx.stack.pop_back();
     return dispatch_next(s);
 }
@@ -338,18 +372,18 @@ VPACK_CODE bool h_pop_reg(VmExecState& s) noexcept {
 VPACK_CODE bool h_load64(VmExecState& s) noexcept {
     uint8_t dst = 0, addr_reg = 0;
     if (!s.read_u8(dst) || !s.read_u8(addr_reg) || dst >= REG_COUNT || addr_reg >= REG_COUNT) return false;
-    const auto* ptr = reinterpret_cast<const uint64_t*>(s.ctx.regs[addr_reg]);
+    const auto* ptr = reinterpret_cast<const uint64_t*>(s.ctx.vreg(addr_reg));
     if (!ptr) return false;
-    std::memcpy(&s.ctx.regs[dst], ptr, sizeof(uint64_t));
+    std::memcpy(&s.ctx.vreg(dst), ptr, sizeof(uint64_t));
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_store64(VmExecState& s) noexcept {
     uint8_t addr_reg = 0, src = 0;
     if (!s.read_u8(addr_reg) || !s.read_u8(src) || addr_reg >= REG_COUNT || src >= REG_COUNT) return false;
-    auto* ptr = reinterpret_cast<uint64_t*>(s.ctx.regs[addr_reg]);
+    auto* ptr = reinterpret_cast<uint64_t*>(s.ctx.vreg(addr_reg));
     if (!ptr) return false;
-    std::memcpy(ptr, &s.ctx.regs[src], sizeof(uint64_t));
+    std::memcpy(ptr, &s.ctx.vreg(src), sizeof(uint64_t));
     return dispatch_next(s);
 }
 
@@ -358,18 +392,108 @@ VPACK_CODE bool h_call_native(VmExecState& s) noexcept {
     if (!s.read_u16(slot) || !s.read_u8(dst_ret) || dst_ret >= REG_COUNT) return false;
     auto it = s.native_table.find(slot);
     if (it == s.native_table.end() || !it->second) return false;
-    s.ctx.regs[dst_ret] = it->second(s.ctx.regs[R0], s.ctx.regs[R1], s.ctx.regs[R2], s.ctx.regs[R3]);
+    s.ctx.vreg(dst_ret) = it->second(
+        s.ctx.vreg(R0), s.ctx.vreg(R1), s.ctx.vreg(R2), s.ctx.vreg(R3)
+    );
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_anti_debug_check(VmExecState& s) noexcept {
-    if (antidebug::check_peb_being_debugged() || antidebug::check_nt_global_flag()) {
+    const uint64_t live_poison = antidebug::compute_environmental_key_poison();
+    s.ctx.env_poison ^= live_poison;
+    if (live_poison != 0 || antidebug::check_peb_being_debugged() || antidebug::check_nt_global_flag()) {
         s.ctx.tampered = true;
         s.ctx.flags |= FLAG_TRAP;
-        for (auto& r : s.ctx.regs) {
-            r ^= 0xDEAD0000BAD00000ULL;
+        for (uint8_t i = 0; i < REG_COUNT; ++i) {
+            s.ctx.vreg(i) = crypto::mba_xor(s.ctx.vreg(i), live_poison ^ 0xDEAD0000BAD00000ULL);
         }
     }
+    return dispatch_next(s);
+}
+
+// Synchronizes rolling decryption key at basic-block label entry
+VPACK_CODE bool h_sync_state(VmExecState& s) noexcept {
+    s.ctx.rolling_state = sync_rolling_state(s.seed, s.ctx.ip) ^ s.ctx.env_poison;
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_mba_add(VmExecState& s) noexcept {
+    uint8_t dst = 0, src = 0;
+    if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
+    s.ctx.vreg(dst) = crypto::mba_add(s.ctx.vreg(dst), s.ctx.vreg(src));
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_mba_sub(VmExecState& s) noexcept {
+    uint8_t dst = 0, src = 0;
+    if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
+    s.ctx.vreg(dst) = crypto::mba_sub(s.ctx.vreg(dst), s.ctx.vreg(src));
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_mba_xor(VmExecState& s) noexcept {
+    uint8_t dst = 0, src = 0;
+    if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
+    s.ctx.vreg(dst) = crypto::mba_xor(s.ctx.vreg(dst), s.ctx.vreg(src));
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_gf2_mul(VmExecState& s) noexcept {
+    uint8_t dst = 0, src = 0;
+    if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
+    s.ctx.vreg(dst) = crypto::gf2_64_mul(s.ctx.vreg(dst), s.ctx.vreg(src));
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    return dispatch_next(s);
+}
+
+// Dynamically rotates the virtual-to-physical register mapping in RAM so physical
+// register slots constantly change location while preserving virtual register values.
+VPACK_CODE bool h_rotate_regs(VmExecState& s) noexcept {
+    uint8_t step = 0;
+    if (!s.read_u8(step)) return false;
+    const uint8_t rot = (step & 0x0Fu) | 1u;
+
+    std::array<uint64_t, REG_COUNT> logical_snapshot{};
+    for (uint8_t i = 0; i < REG_COUNT; ++i) {
+        logical_snapshot[i] = s.ctx.vreg(i);
+    }
+    for (uint8_t i = 0; i < REG_COUNT; ++i) {
+        s.ctx.reg_map[i] = static_cast<uint8_t>((s.ctx.reg_map[i] + rot) & 0x0Fu);
+    }
+    for (uint8_t i = 0; i < REG_COUNT; ++i) {
+        s.ctx.regs[s.ctx.reg_map[i]] = logical_snapshot[i];
+    }
+    crypto::secure_wipe(logical_snapshot.data(), sizeof(logical_snapshot), s.ctx.rolling_state);
+    return dispatch_next(s);
+}
+
+// State-Matrix Automaton: applies an invertible 2x2 Feistel-Matrix transformation
+// over (R0, R1) in GF(2^64) x Z_{2^64}
+VPACK_CODE bool h_state_matrix(VmExecState& s) noexcept {
+    uint8_t mkey = 0;
+    if (!s.read_u8(mkey)) return false;
+    const uint64_t k  = static_cast<uint64_t>(mkey) * 0x9E3779B97F4A7C15ULL;
+    const uint64_t r0 = s.ctx.vreg(R0);
+    const uint64_t r1 = s.ctx.vreg(R1);
+    const uint64_t f0 = crypto::gf2_64_mul(r1 ^ k, 0xBF58476D1CE4E5B9ULL | 1ULL);
+    const uint64_t n0 = crypto::mba_xor(r0, crypto::mba_add(f0, r1 * 0x94D049BB133111EBULL));
+    const uint64_t f1 = crypto::poly_permute_64(n0, k ^ 0x5341424C45ULL);
+    const uint64_t n1 = crypto::mba_xor(r1, f1);
+    s.ctx.vreg(R0)    = n0;
+    s.ctx.vreg(R1)    = n1;
+    update_alu_flags(s.ctx, n0);
+    return dispatch_next(s);
+}
+
+// Branchless Environmental Key Entanglement: mixes live anti-debug/integrity poison into dst
+VPACK_CODE bool h_entangle_env(VmExecState& s) noexcept {
+    uint8_t dst = 0;
+    if (!s.read_u8(dst) || dst >= REG_COUNT) return false;
+    const uint64_t poison = antidebug::compute_environmental_key_poison() ^ s.ctx.env_poison;
+    s.ctx.vreg(dst)       = crypto::mba_xor(s.ctx.vreg(dst), poison);
     return dispatch_next(s);
 }
 
@@ -378,34 +502,10 @@ VPACK_CODE bool h_ret(VmExecState& s) noexcept {
     return !s.ctx.tampered;
 }
 
-VPACK_FORCEINLINE uintptr_t encode_handler_slot(VmHandlerFn fn, uintptr_t mask, size_t idx) noexcept {
-    return reinterpret_cast<uintptr_t>(reinterpret_cast<void*>(fn)) ^ mask ^ (idx * 0x9E3779B9u);
-}
-
 } // namespace
 
-PolymorphicOpcodeTable PolymorphicOpcodeTable::generate(uint64_t seed) noexcept {
-    PolymorphicOpcodeTable table{};
-    for (size_t i = 0; i < 256; ++i) {
-        table.logical_to_physical[i] = static_cast<uint8_t>(i);
-    }
-
-    uint64_t prng = seed ^ 0xA55AA55A5AA55AA5ULL;
-    for (size_t i = 255; i > 0; --i) {
-        size_t j = static_cast<size_t>(splitmix64(prng) % (i + 1));
-        uint8_t tmp = table.logical_to_physical[i];
-        table.logical_to_physical[i] = table.logical_to_physical[j];
-        table.logical_to_physical[j] = tmp;
-    }
-
-    for (size_t i = 0; i < 256; ++i) {
-        table.physical_to_logical[table.logical_to_physical[i]] = static_cast<uint8_t>(i);
-    }
-    return table;
-}
-
 BytecodeBuilder::BytecodeBuilder(uint64_t seed)
-    : seed_(seed), op_table_(PolymorphicOpcodeTable::generate(seed)) {}
+    : seed_(seed), op_table_(PolymorphicOpcodeTable::generate_constexpr(seed)) {}
 
 void BytecodeBuilder::emit_op(LogicalOpcode op) {
     raw_code_.push_back(op_table_.logical_to_physical[static_cast<uint8_t>(op)]);
@@ -575,7 +675,10 @@ BytecodeBuilder& BytecodeBuilder::cmp_imm(VmReg lhs, uint64_t imm) {
 }
 
 BytecodeBuilder& BytecodeBuilder::label(const std::string& name) {
-    labels_[name] = static_cast<uint32_t>(raw_code_.size());
+    emit_op(OP_SYNC_STATE);
+    const uint32_t target = static_cast<uint32_t>(raw_code_.size());
+    labels_[name] = target;
+    sync_offsets_.push_back(target);
     return *this;
 }
 
@@ -642,6 +745,52 @@ BytecodeBuilder& BytecodeBuilder::anti_debug_check() {
     return *this;
 }
 
+BytecodeBuilder& BytecodeBuilder::mba_add(VmReg dst, VmReg src) {
+    emit_op(OP_MBA_ADD);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(static_cast<uint8_t>(src));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::mba_sub(VmReg dst, VmReg src) {
+    emit_op(OP_MBA_SUB);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(static_cast<uint8_t>(src));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::mba_xor(VmReg dst, VmReg src) {
+    emit_op(OP_MBA_XOR);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(static_cast<uint8_t>(src));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::gf2_mul(VmReg dst, VmReg src) {
+    emit_op(OP_GF2_MUL);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(static_cast<uint8_t>(src));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::rotate_regs(uint8_t step) {
+    emit_op(OP_ROTATE_REGS);
+    emit_u8(step);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::state_matrix(uint8_t matrix_key) {
+    emit_op(OP_STATE_MATRIX);
+    emit_u8(matrix_key);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::entangle_env(VmReg target_reg) {
+    emit_op(OP_ENTANGLE_ENV);
+    emit_u8(static_cast<uint8_t>(target_reg));
+    return *this;
+}
+
 BytecodeBuilder& BytecodeBuilder::ret() {
     emit_op(OP_RET);
     return *this;
@@ -660,13 +809,26 @@ VmProgram BytecodeBuilder::finalize() const {
         }
     }
 
-    uint64_t tag = crypto::fnv1a_64(resolved.data(), resolved.size()) ^ seed_;
-    crypto::rolling_encrypt(resolved.data(), resolved.size(), seed_);
+    uint64_t rolling_state = sync_rolling_state(seed_, 0);
+    for (size_t idx = 0; idx < resolved.size(); ++idx) {
+        for (uint32_t sync_off : sync_offsets_) {
+            if (sync_off == idx) {
+                rolling_state = sync_rolling_state(seed_, idx);
+                break;
+            }
+        }
+        uint8_t plain = resolved[idx];
+        uint8_t ks    = rolling_stream_byte(rolling_state, idx, seed_);
+        resolved[idx] = static_cast<uint8_t>(plain ^ ks);
+        rolling_state = step_rolling_state(rolling_state, plain, idx, seed_);
+    }
+
+    uint64_t tag = compute_ciphertext_tag(resolved.data(), resolved.size(), seed_);
 
     VmProgram prog;
-    prog.seed = seed_;
+    prog.seed          = seed_;
     prog.integrity_tag = tag;
-    prog.bytecode = std::move(resolved);
+    prog.bytecode      = std::move(resolved);
     return prog;
 }
 
@@ -674,27 +836,33 @@ void VmEngine::register_native(uint16_t slot_id, NativeCallback fn) {
     native_table_[slot_id] = fn;
 }
 
-VPACK_CODE bool VmEngine::execute(const VmProgram& program, VmContext& ctx, uint64_t* out_return_value) const noexcept {
+bool VmEngine::execute(const VmProgram& program, VmContext& ctx, uint64_t* out_return_value) const noexcept {
     if (program.bytecode.empty()) {
         return false;
     }
 
-    std::vector<uint8_t> code = program.bytecode;
-    crypto::rolling_decrypt(code.data(), code.size(), program.seed);
-
-    uint64_t computed_tag = crypto::fnv1a_64(code.data(), code.size()) ^ program.seed;
+    // 1. Verify integrity tag DIRECTLY on the ciphertext without ever bulk-decrypting in RAM!
+    const uint64_t computed_tag = compute_ciphertext_tag(
+        program.bytecode.data(), program.bytecode.size(), program.seed
+    );
     if (computed_tag != program.integrity_tag) {
-        std::memset(code.data(), 0, code.size());
         ctx.tampered = true;
-        ctx.halted = true;
+        ctx.halted   = true;
         return false;
     }
 
-    // Immediately re-encrypt bytecode in RAM with an ephemeral per-execution RDTSC key
-    // so plaintext bytecode NEVER resides in memory during VM execution!
+    // 2. Superimpose an additional per-execution ephemeral RDTSC stream over the rolling ciphertext
+    std::vector<uint8_t> code = program.bytecode;
     const uint64_t ephemeral_key = __rdtsc() ^ program.seed ^ 0xA59E3779B97F4A7CULL;
     for (size_t i = 0; i < code.size(); ++i) {
         code[i] ^= ephemeral_stream_byte(ephemeral_key, i);
+    }
+
+    // 3. JIT-unlock and decrypt the .vcode handler section ONLY for the duration of VM execution
+    antidump::JitSectionGuard jit_guard;
+    if (jit_guard.is_tampered()) {
+        ctx.env_poison ^= 0xBAD0C0DE1337BEEFULL;
+        ctx.tampered = true;
     }
 
     const uintptr_t runtime_ptr_mask = kHandlerPtrMask ^ static_cast<uintptr_t>(ephemeral_key);
@@ -730,14 +898,27 @@ VPACK_CODE bool VmEngine::execute(const VmProgram& program, VmContext& ctx, uint
         encode_handler_slot(&h_store64,          runtime_ptr_mask, 28),
         encode_handler_slot(&h_call_native,      runtime_ptr_mask, 29),
         encode_handler_slot(&h_anti_debug_check, runtime_ptr_mask, 30),
-        encode_handler_slot(&h_ret,              runtime_ptr_mask, 31)
+        encode_handler_slot(&h_sync_state,       runtime_ptr_mask, 31),
+        encode_handler_slot(&h_mba_add,          runtime_ptr_mask, 32),
+        encode_handler_slot(&h_mba_sub,          runtime_ptr_mask, 33),
+        encode_handler_slot(&h_mba_xor,          runtime_ptr_mask, 34),
+        encode_handler_slot(&h_gf2_mul,          runtime_ptr_mask, 35),
+        encode_handler_slot(&h_rotate_regs,      runtime_ptr_mask, 36),
+        encode_handler_slot(&h_state_matrix,     runtime_ptr_mask, 37),
+        encode_handler_slot(&h_entangle_env,     runtime_ptr_mask, 38),
+        encode_handler_slot(&h_ret,              runtime_ptr_mask, 39)
     };
 
-    const PolymorphicOpcodeTable op_table = PolymorphicOpcodeTable::generate(program.seed);
+    for (uint8_t i = 0; i < REG_COUNT; ++i) {
+        ctx.reg_map[i] = i;
+    }
+
+    const PolymorphicOpcodeTable op_table = PolymorphicOpcodeTable::generate_constexpr(program.seed);
     VmExecState state{
         ctx,
         code,
         code.size(),
+        program.seed,
         ephemeral_key,
         runtime_ptr_mask,
         op_table,
@@ -745,16 +926,21 @@ VPACK_CODE bool VmEngine::execute(const VmProgram& program, VmContext& ctx, uint
         native_table_
     };
 
-    ctx.ip = 0;
-    ctx.halted = false;
-    ctx.tampered = false;
+    ctx.ip            = 0;
+    ctx.rolling_state = sync_rolling_state(program.seed, 0) ^ ctx.env_poison;
+    ctx.stack_key     = ephemeral_key ^ 0x535441434B5F4B59ULL;
+    ctx.halted        = false;
+    ctx.tampered      = jit_guard.is_tampered();
 
     const bool ok = dispatch_next(state);
-    std::memset(code.data(), 0, code.size());
 
+    const uint64_t final_r0 = ctx.vreg(R0);
+    ctx.regs[R0] = final_r0;
     if (out_return_value) {
-        *out_return_value = ctx.regs[R0];
+        *out_return_value = final_r0;
     }
+
+    crypto::secure_wipe(code.data(), code.size(), ephemeral_key);
     return ok && ctx.halted && !ctx.tampered;
 }
 
@@ -775,6 +961,7 @@ uint64_t VmEngine::run_WithArgs(
     uint64_t ret = 0;
     bool ok = execute(program, ctx, &ret);
     if (out_ok) *out_ok = ok;
+    crypto::secure_wipe(ctx.regs.data(), sizeof(ctx.regs), ret);
     return ret;
 }
 
