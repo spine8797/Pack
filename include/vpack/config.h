@@ -36,6 +36,7 @@ enum ProtectionFlags : uint32_t {
     PROT_STUB_ANTI_DEBUG    = 1u << 6,
     PROT_DIRECT_SYSCALL     = 1u << 7,
     PROT_JIT_VCODE          = 1u << 8,
+    PROT_PAGE_VAULT         = 1u << 9,
     PROT_DEFAULT            = PROT_ANTI_DEBUG | PROT_ANTI_DUMP | PROT_HIDE_THREAD |
                               PROT_CLEAR_HWBP | PROT_VERIFY_INTEGRITY | PROT_TAMPER_IMAGE_SIZE |
                               PROT_STUB_ANTI_DEBUG | PROT_DIRECT_SYSCALL | PROT_JIT_VCODE

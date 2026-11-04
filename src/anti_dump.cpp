@@ -1,4 +1,5 @@
 #include "vpack/anti_dump.h"
+#include "vpack/page_vault.h"
 #include "vpack/crypto.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -111,14 +112,6 @@ void acquire_jit_lock() noexcept {
 
 void release_jit_lock() noexcept {
     g_jit_owner_tid.store(0, std::memory_order_release);
-}
-
-void stub_stream_xor_compat(uint8_t* data, size_t size, uint64_t key) noexcept {
-    uint64_t r10 = key;
-    for (size_t i = 0; i < size; ++i) {
-        r10 = rotr64(r10, 13) + 0x9E3779B97F4A7C15ULL;
-        data[i] ^= static_cast<uint8_t>(r10 & 0xFF);
-    }
 }
 
 // Fast GF(2^64) + Non-Linear MBA stream cipher for in-memory JIT code pages
@@ -344,25 +337,60 @@ bool init_jit_vcode_vault(
         return false;
     }
 
-    if (already_encrypted_by_stub) {
-        stub_stream_xor_compat(vcode_base, vcode_size, boot_key);
+    // Derive initial ephemeral rolling key from RDTSC + KUSER_SHARED_DATA + boot_key
+    g_vcode_rolling_key = crypto::poly_permute_64(
+        __rdtsc() ^ read_kuser_interrupt_time() ^ boot_key,
+        boot_key ^ 0x4A414E55535F4B59ULL
+    );
+
+    // Single-pass register-only trans-encryption:
+    // Transitions .vcode directly from Stage 2's boot stream into the runtime JIT MBA stream
+    // while computing g_vcode_plain_hash in CPU registers so plaintext .vcode NEVER sits in RAM!
+    uint64_t fnv_hash  = 0xCBF29CE484222325ULL;
+    uint64_t stub_r10  = boot_key;
+    uint64_t jit_state = crypto::mba_xor(g_vcode_rolling_key, 0x4A414E55535F564DULL);
+
+    size_t words = vcode_size / 8;
+    auto*  wptr  = reinterpret_cast<uint64_t*>(vcode_base);
+    for (size_t i = 0; i < words; ++i) {
+        uint64_t stub_ks_word = 0;
+        if (already_encrypted_by_stub) {
+            for (int b = 0; b < 8; ++b) {
+                stub_r10 = rotr64(stub_r10, 13) + 0x9E3779B97F4A7C15ULL;
+                stub_ks_word |= static_cast<uint64_t>(stub_r10 & 0xFFULL) << (b * 8);
+            }
+        }
+
+        const uint64_t plain_word = wptr[i] ^ stub_ks_word;
+        for (int b = 0; b < 8; ++b) {
+            fnv_hash ^= static_cast<uint8_t>((plain_word >> (b * 8)) & 0xFFULL);
+            fnv_hash *= 0x100000001B3ULL;
+        }
+
+        jit_state = crypto::mba_add(rotr64(jit_state, 17), 0x9E3779B97F4A7C15ULL * (i + 1));
+        const uint64_t jit_ks_word = crypto::poly_permute_64(jit_state, g_vcode_rolling_key ^ static_cast<uint64_t>(i));
+        wptr[i] = plain_word ^ jit_ks_word;
+    }
+    for (size_t i = words * 8; i < vcode_size; ++i) {
+        uint8_t stub_ks_byte = 0;
+        if (already_encrypted_by_stub) {
+            stub_r10 = rotr64(stub_r10, 13) + 0x9E3779B97F4A7C15ULL;
+            stub_ks_byte = static_cast<uint8_t>(stub_r10 & 0xFFULL);
+        }
+        const uint8_t plain_byte = static_cast<uint8_t>(vcode_base[i] ^ stub_ks_byte);
+        fnv_hash ^= plain_byte;
+        fnv_hash *= 0x100000001B3ULL;
+
+        jit_state = crypto::mba_add(rotr64(jit_state, 11), 0xBF58476D1CE4E5B9ULL);
+        const uint8_t jit_ks_byte = static_cast<uint8_t>((jit_state ^ (jit_state >> 29)) & 0xFFu);
+        vcode_base[i] = static_cast<uint8_t>(plain_byte ^ jit_ks_byte);
     }
 
-    // Record baseline plaintext hash of .vcode after ASLR relocations
-    g_vcode_plain_hash   = crypto::fnv1a_64(vcode_base, vcode_size);
+    g_vcode_plain_hash   = fnv_hash;
     g_vcode_encoded_base = reinterpret_cast<uintptr_t>(vcode_base) ^ kJitPtrMask;
     g_vcode_size         = vcode_size;
     g_vcode_generation.store(1, std::memory_order_relaxed);
-
-    // Derive initial ephemeral rolling key from RDTSC + KUSER_SHARED_DATA + plaintext hash
-    g_vcode_rolling_key = crypto::poly_permute_64(
-        __rdtsc() ^ read_kuser_interrupt_time() ^ boot_key,
-        g_vcode_plain_hash ^ 0x4A414E55535F4B59ULL
-    );
-
-    // Encrypt .vcode in RAM so it is NEVER plaintext at rest
-    jit_mba_stream_transform(vcode_base, vcode_size, g_vcode_rolling_key);
-    g_vcode_cipher_hash = crypto::fnv1a_64(vcode_base, vcode_size);
+    g_vcode_cipher_hash  = crypto::fnv1a_64(vcode_base, vcode_size);
 
     // Lock .vcode to PAGE_READONLY (non-executable, non-writable, encrypted at rest)
     protect_memory_via_syscall(vcode_base, vcode_size, PAGE_READONLY, &old_prot);
@@ -540,6 +568,9 @@ bool query_module_layout(void* module_base, ModuleLayoutInfo& out_info) noexcept
 }
 
 uint64_t compute_text_integrity(void* module_base) noexcept {
+    if (!module_base && vault::active()) {
+        return vault::cipher_hash();
+    }
     ModuleLayoutInfo info{};
     if (!query_module_layout(module_base, info) || !info.text_section_base || info.text_section_size == 0) {
         return 0;

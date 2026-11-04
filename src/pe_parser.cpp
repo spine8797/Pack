@@ -30,6 +30,10 @@ void stub_stream_xor(uint8_t* data, size_t size, uint64_t key) noexcept {
     }
 }
 
+constexpr uint64_t derive_morph_key(uint64_t master_seed) noexcept {
+    return crypto::poly_permute_64(master_seed, 0x4A414E55535F4D4FULL);
+}
+
 constexpr uint32_t kSynthImportOffset = 0x900;
 constexpr uint32_t kSynthIltOffset    = 0x930;
 constexpr uint32_t kSynthIatOffset    = 0x948;
@@ -89,9 +93,19 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
             buf[pos + i] = static_cast<uint8_t>((val >> (i * 8)) & 0xFF);
         }
     };
+    auto write_u64 = [](std::vector<uint8_t>& buf, size_t pos, uint64_t val) {
+        for (int i = 0; i < 8; ++i) {
+            buf[pos + i] = static_cast<uint8_t>((val >> (i * 8)) & 0xFF);
+        }
+    };
+
+    const uint64_t morph_key       = derive_morph_key(vhdr.master_seed);
+    const uint32_t morph_lo        = static_cast<uint32_t>(morph_key & 0xFFFFFFFFULL);
+    const uint32_t morph_hi        = static_cast<uint32_t>((morph_key >> 32) & 0xFFFFFFFFULL);
+    const uint64_t vcode_boot_salt = morph_key ^ 0x4A49545653424C31ULL;
 
     // -------------------------------------------------------------------------
-    // 1. EntryPoint Stub at kEpStubOffset (0x200)
+    // 1. EntryPoint Stub at kEpStubOffset (0xA00)
     // -------------------------------------------------------------------------
     {
         std::vector<uint8_t> ep;
@@ -115,12 +129,15 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
         emit({0x65, 0x4C, 0x8B, 0x1C, 0x25, 0x60, 0x00, 0x00, 0x00});
         // mov r11, [r11 + 0x10] (ImageBase)
         emit({0x4D, 0x8B, 0x5B, 0x10});
-        // mov r10d, dword ptr [rax + 0x10] (low32(master_seed))
-        emit({0x44, 0x8B, 0x50, 0x10});
-        // mov eax, dword ptr [rax + 0x0C] (masked original_entry_rva)
-        emit({0x8B, 0x40, 0x0C});
-        // xor eax, r10d (unmask original_entry_rva)
-        emit({0x44, 0x31, 0xD0});
+        // mov r10d, dword ptr [rax + 0x0C] (masked original_entry_rva)
+        emit({0x44, 0x8B, 0x50, 0x0C});
+        // mov dword ptr [rax + 0x0C], 0 (wipe OEP in RAM while rax still points to VPackHeader!)
+        emit({0xC7, 0x40, 0x0C, 0x00, 0x00, 0x00, 0x00});
+        // mov eax, r10d
+        emit({0x44, 0x89, 0xD0});
+        // xor eax, morph_lo (unmask original_entry_rva using baked morph_lo)
+        emit({0x35, 0, 0, 0, 0});
+        write_i32(ep, ep.size() - 4, static_cast<int32_t>(morph_lo));
         // add rax, r11 (ImageBase + original_entry_rva)
         emit({0x4C, 0x01, 0xD8});
         // jmp rax
@@ -130,7 +147,7 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
     }
 
     // -------------------------------------------------------------------------
-    // 2. TLS Callback Stub at kTlsStubOffset (0x240)
+    // 2. TLS Callback Stub at kTlsStubOffset (0xA40)
     // -------------------------------------------------------------------------
     {
         std::vector<uint8_t> tls;
@@ -154,12 +171,11 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
         emit({0x65, 0x4C, 0x8B, 0x1C, 0x25, 0x60, 0x00, 0x00, 0x00});
         // mov r11, [r11 + 0x10] (ImageBase)
         emit({0x4D, 0x8B, 0x5B, 0x10});
-        // mov r10d, dword ptr [rax + 0x14] (high32(master_seed))
-        emit({0x44, 0x8B, 0x50, 0x14});
         // mov eax, dword ptr [rax + 0x20] (masked orig_tls_callback_rva)
         emit({0x8B, 0x40, 0x20});
-        // xor eax, r10d (unmask orig_tls_callback_rva)
-        emit({0x44, 0x31, 0xD0});
+        // xor eax, morph_hi (unmask orig_tls_callback_rva using baked morph_hi)
+        emit({0x35, 0, 0, 0, 0});
+        write_i32(tls, tls.size() - 4, static_cast<int32_t>(morph_hi));
         // test eax, eax
         emit({0x85, 0xC0});
         // jz +5 (to ret)
@@ -175,7 +191,7 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
     }
 
     // -------------------------------------------------------------------------
-    // 3. Stage 2 Encrypted Unpacker Engine (placed at kStage2Offset = 0x300)
+    // 3. Stage 2 Encrypted Unpacker Engine (placed at kStage2Offset = 0xB00)
     // -------------------------------------------------------------------------
     std::vector<uint8_t> stage2;
     {
@@ -211,66 +227,105 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
         const size_t jz_regions_done_pos = stage2.size();
         emit({0x74, 0x00}); // jz lbl_regions_done
 
-        emit({0x41, 0x8B, 0x48, 0x04}); // mov ecx, dword ptr [r8 + 0x04] (masked region.size)
-        emit({0x33, 0x4B, 0x14});       // xor ecx, dword ptr [rbx + 0x14] (unmask with high32(master_seed))
-        emit({0x85, 0xC9});             // test ecx, ecx
+        emit({0x41, 0x8B, 0x48, 0x04});       // mov ecx, dword ptr [r8 + 0x04] (masked region.size)
+        emit({0x81, 0xF1, 0, 0, 0, 0});       // xor ecx, morph_hi (unmask using baked morph_hi)
+        write_i32(stage2, stage2.size() - 4, static_cast<int32_t>(morph_hi));
+        emit({0x85, 0xC9});                   // test ecx, ecx
         const size_t jz_next_region_pos = stage2.size();
-        emit({0x74, 0x00});             // jz lbl_next_region
+        emit({0x74, 0x00});                   // jz lbl_next_region
 
-        emit({0x41, 0x8B, 0x00});       // mov eax, dword ptr [r8 + 0x00] (masked region.rva)
-        emit({0x33, 0x43, 0x10});       // xor eax, dword ptr [rbx + 0x10] (unmask with low32(master_seed))
-        emit({0x48, 0x8D, 0x3C, 0x06}); // lea rdi, [rsi + rax]
-        emit({0x4D, 0x8B, 0x50, 0x08}); // mov r10, qword ptr [r8 + 0x08] (region.key)
-        emit({0x4D, 0x31, 0xCA});       // xor r10, r9
+        emit({0x41, 0x8B, 0x00});             // mov eax, dword ptr [r8 + 0x00] (masked region.rva)
+        emit({0x35, 0, 0, 0, 0});             // xor eax, morph_lo (unmask using baked morph_lo)
+        write_i32(stage2, stage2.size() - 4, static_cast<int32_t>(morph_lo));
+        emit({0x48, 0x8D, 0x3C, 0x06});       // lea rdi, [rsi + rax]
+        emit({0x4D, 0x8B, 0x50, 0x08});       // mov r10, qword ptr [r8 + 0x08] (masked region.key)
+        emit({0x49, 0xBB, 0,0,0,0,0,0,0,0});  // mov r11, morph_key
+        write_u64(stage2, stage2.size() - 8, morph_key);
+        emit({0x4D, 0x31, 0xDA});             // xor r10, r11 (unmask region.key)
+        emit({0x4D, 0x31, 0xCA});             // xor r10, r9
         emit({0x49, 0xBB, 0x15, 0x7C, 0x4A, 0x7F, 0xB9, 0x79, 0x37, 0x9E}); // mov r11, 0x9E3779B97F4A7C15
 
         const size_t lbl_byte_loop = stage2.size();
-        emit({0x49, 0xC1, 0xCA, 0x0D}); // ror r10, 13
-        emit({0x4D, 0x01, 0xDA});       // add r10, r11
-        emit({0x44, 0x88, 0xD0});       // mov al, r10b
-        emit({0x30, 0x07});             // xor byte ptr [rdi], al
-        emit({0x48, 0xFF, 0xC7});       // inc rdi
-        emit({0xFF, 0xC9});             // dec ecx
+        emit({0x49, 0xC1, 0xCA, 0x0D});       // ror r10, 13
+        emit({0x4D, 0x01, 0xDA});             // add r10, r11
+        emit({0x44, 0x88, 0xD0});             // mov al, r10b
+        emit({0x30, 0x07});                   // xor byte ptr [rdi], al
+        emit({0x48, 0xFF, 0xC7});             // inc rdi
+        emit({0xFF, 0xC9});                   // dec ecx
         int8_t rel_byte_loop = static_cast<int8_t>(static_cast<intptr_t>(lbl_byte_loop) - static_cast<intptr_t>(stage2.size() + 2));
         emit({0x75, static_cast<uint8_t>(rel_byte_loop)});
 
-        // Wipe region.key in memory: mov qword ptr [r8 + 0x08], 0
-        emit({0x49, 0xC7, 0x40, 0x08, 0x00, 0x00, 0x00, 0x00});
+        // Wipe entire 24-byte VPackRegion (rva, size, key, plain_hash) in RAM immediately!
+        emit({0x31, 0xC0});                   // xor eax, eax
+        emit({0x49, 0x89, 0x00});             // mov qword ptr [r8 + 0x00], rax
+        emit({0x49, 0x89, 0x40, 0x08});       // mov qword ptr [r8 + 0x08], rax
+        emit({0x49, 0x89, 0x40, 0x10});       // mov qword ptr [r8 + 0x10], rax
 
         const size_t lbl_next_region = stage2.size();
         stage2[jz_next_region_pos + 1] = static_cast<uint8_t>(lbl_next_region - (jz_next_region_pos + 2));
 
-        emit({0x49, 0x83, 0xC0, 0x18}); // add r8, 0x18
-        emit({0xFF, 0xCA});             // dec edx
+        emit({0x49, 0x83, 0xC0, 0x18});       // add r8, 0x18
+        emit({0xFF, 0xCA});                   // dec edx
         int8_t rel_region_loop = static_cast<int8_t>(static_cast<intptr_t>(lbl_region_loop) - static_cast<intptr_t>(stage2.size() + 2));
         emit({0xEB, static_cast<uint8_t>(rel_region_loop)});
 
         const size_t lbl_regions_done = stage2.size();
         stage2[jz_regions_done_pos + 1] = static_cast<uint8_t>(lbl_regions_done - (jz_regions_done_pos + 2));
 
-        // Apply deferred code relocations if ASLR moved ImageBase
-        emit({0x48, 0x89, 0xF2});       // mov rdx, rsi (RuntimeImageBase)
-        emit({0x48, 0x2B, 0x53, 0x18}); // sub rdx, qword ptr [rbx + 0x18] (preferred_image_base)
-        const size_t jz_no_delta_pos = stage2.size();
-        emit({0x74, 0x00});             // jz lbl_stage2_ret
-
-        emit({0x8B, 0x4B, 0x24});       // mov ecx, dword ptr [rbx + 0x24] (code_reloc_count)
-        emit({0x85, 0xC9});             // test ecx, ecx
+        // Apply deferred code relocations AND wipe every code_reloc_rvas[k] entry in RAM!
+        emit({0x48, 0x89, 0xF2});             // mov rdx, rsi (RuntimeImageBase)
+        emit({0x48, 0x2B, 0x53, 0x18});       // sub rdx, qword ptr [rbx + 0x18] (preferred_image_base)
+        emit({0x8B, 0x4B, 0x24});             // mov ecx, dword ptr [rbx + 0x24] (code_reloc_count)
+        emit({0xC7, 0x43, 0x24, 0, 0, 0, 0}); // mov dword ptr [rbx + 0x24], 0 (wipe code_reloc_count!)
+        emit({0x85, 0xC9});                   // test ecx, ecx
         const size_t jz_no_relocs_pos = stage2.size();
-        emit({0x74, 0x00});             // jz lbl_stage2_ret
+        emit({0x74, 0x00});                   // jz lbl_vcode_reenc
 
         emit({0x4C, 0x8D, 0x83, 0x70, 0x02, 0x00, 0x00}); // lea r8, [rbx + 0x270] (&code_reloc_rvas[0])
         const size_t lbl_reloc_loop = stage2.size();
-        emit({0x41, 0x8B, 0x00});       // mov eax, dword ptr [r8]
-        emit({0x48, 0x01, 0x14, 0x06}); // add qword ptr [rsi + rax], rdx
-        emit({0x49, 0x83, 0xC0, 0x04}); // add r8, 4
-        emit({0xFF, 0xC9});             // dec ecx
+        emit({0x41, 0x8B, 0x00});             // mov eax, dword ptr [r8] (masked reloc rva)
+        emit({0x41, 0xC7, 0x00, 0, 0, 0, 0}); // mov dword ptr [r8], 0 (wipe reloc entry in RAM!)
+        emit({0x35, 0, 0, 0, 0});             // xor eax, morph_lo (unmask reloc rva)
+        write_i32(stage2, stage2.size() - 4, static_cast<int32_t>(morph_lo));
+        emit({0x48, 0x01, 0x14, 0x06});       // add qword ptr [rsi + rax], rdx
+        emit({0x49, 0x83, 0xC0, 0x04});       // add r8, 4
+        emit({0xFF, 0xC9});                   // dec ecx
         int8_t rel_reloc_loop = static_cast<int8_t>(static_cast<intptr_t>(lbl_reloc_loop) - static_cast<intptr_t>(stage2.size() + 2));
         emit({0x75, static_cast<uint8_t>(rel_reloc_loop)});
 
+        const size_t lbl_vcode_reenc = stage2.size();
+        stage2[jz_no_relocs_pos + 1] = static_cast<uint8_t>(lbl_vcode_reenc - (jz_no_relocs_pos + 2));
+
+        // Immediately re-encrypt .vcode (.sbl1) inside Stage 2 right after relocations so .vcode is
+        // NEVER plaintext during Import Resolution, at OEP (0x105F), or during CRT startup before main()!
+        emit({0x8B, 0x8B, 0xF8, 0x08, 0x00, 0x00}); // mov ecx, dword ptr [rbx + 0x8F8] (masked vcode_size)
+        emit({0x33, 0x4B, 0x14});                   // xor ecx, dword ptr [rbx + 0x14] (unmask with seed_hi)
+        emit({0x85, 0xC9});                         // test ecx, ecx
+        const size_t jz_skip_vcode_reenc_pos = stage2.size();
+        emit({0x74, 0x00});                         // jz lbl_stage2_imports
+
+        emit({0x8B, 0x83, 0xF4, 0x08, 0x00, 0x00}); // mov eax, dword ptr [rbx + 0x8F4] (masked vcode_rva)
+        emit({0x33, 0x43, 0x10});                   // xor eax, dword ptr [rbx + 0x10] (unmask with seed_lo)
+        emit({0x48, 0x8D, 0x3C, 0x06});             // lea rdi, [rsi + rax] (base + vcode_rva)
+        emit({0x4C, 0x8B, 0x53, 0x10});             // mov r10, qword ptr [rbx + 0x10] (master_seed)
+        emit({0x49, 0xBB, 0,0,0,0,0,0,0,0});        // mov r11, vcode_boot_salt
+        write_u64(stage2, stage2.size() - 8, vcode_boot_salt);
+        emit({0x4D, 0x31, 0xDA});                   // xor r10, r11 (r10 = vcode_boot_key)
+        emit({0x4D, 0x31, 0xCA});                   // xor r10, r9  (mix anti-debug r9)
+        emit({0x49, 0xBB, 0x15, 0x7C, 0x4A, 0x7F, 0xB9, 0x79, 0x37, 0x9E}); // mov r11, 0x9E3779B97F4A7C15
+
+        const size_t lbl_vcode_reenc_loop = stage2.size();
+        emit({0x49, 0xC1, 0xCA, 0x0D});             // ror r10, 13
+        emit({0x4D, 0x01, 0xDA});                   // add r10, r11
+        emit({0x44, 0x88, 0xD0});                   // mov al, r10b
+        emit({0x30, 0x07});                         // xor byte ptr [rdi], al
+        emit({0x48, 0xFF, 0xC7});                   // inc rdi
+        emit({0xFF, 0xC9});                         // dec ecx
+        int8_t rel_vcode_reenc = static_cast<int8_t>(static_cast<intptr_t>(lbl_vcode_reenc_loop) - static_cast<intptr_t>(stage2.size() + 2));
+        emit({0x75, static_cast<uint8_t>(rel_vcode_reenc)});
+
         const size_t lbl_stage2_imports = stage2.size();
-        stage2[jz_no_delta_pos + 1]  = static_cast<uint8_t>(lbl_stage2_imports - (jz_no_delta_pos + 2));
-        stage2[jz_no_relocs_pos + 1] = static_cast<uint8_t>(lbl_stage2_imports - (jz_no_relocs_pos + 2));
+        stage2[jz_skip_vcode_reenc_pos + 1] = static_cast<uint8_t>(lbl_stage2_imports - (jz_skip_vcode_reenc_pos + 2));
 
         // Resolve original Import Table (.idata) dynamically using synthetic LoadLibraryA & GetProcAddress
         emit({0x41, 0x54});             // push r12
@@ -410,6 +465,14 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
         write_i32(stage2, jz_desc_done_pos + 2, static_cast<int32_t>(lbl_imp_done - (jz_desc_done_pos + 6)));
         write_i32(stage2, jz_load_fail_pos + 2, static_cast<int32_t>(lbl_imp_done - (jz_load_fail_pos + 6)));
 
+        // Wipe orig_import_rva [rbx + 0x8F0] and the entire Synthetic Import Table [rbx + 0x900 .. 0x9A0)
+        // right inside Stage 2 so even at OEP (0x105F) zero import artifacts remain in .vpack!
+        emit({0xC7, 0x83, 0xF0, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); // mov dword ptr [rbx + 0x8F0], 0
+        emit({0x48, 0x8D, 0xBB, 0x00, 0x09, 0x00, 0x00});                   // lea rdi, [rbx + 0x900]
+        emit({0xB9, 0xA0, 0x00, 0x00, 0x00});                               // mov ecx, 0xA0
+        emit({0x31, 0xC0});                                                 // xor eax, eax
+        emit({0xF3, 0xAA});                                                 // rep stosb
+
         emit({0x48, 0x89, 0xEC}); // mov rsp, rbp
         emit({0x5D});             // pop rbp
         emit({0x41, 0x5F});       // pop r15
@@ -421,18 +484,23 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
 
     const uint32_t stage2_size = static_cast<uint32_t>(stage2.size());
     const uint8_t  stage2_key  = static_cast<uint8_t>(((vhdr.master_seed >> 19) & 0xFFu) | 0x05u);
+    const uint8_t  s1_rol      = static_cast<uint8_t>(((morph_key >> 7) & 0x06u) | 0x01u);  // 1, 3, 5, or 7
+    const uint8_t  s1_add      = static_cast<uint8_t>(((morph_key >> 15) & 0xFEu) | 0x01u); // odd 1..255
+    const uint8_t  s1_xor      = static_cast<uint8_t>(((morph_key >> 23) & 0xFFu) | 0x11u);
 
-    // Encrypt Stage 2 on disk using rolling byte cipher
+    // Encrypt Stage 2 on disk using per-build metamorphic rolling byte cipher
     {
         uint8_t k = stage2_key;
         for (size_t i = 0; i < stage2.size(); ++i) {
             stage2[i] ^= k;
-            k = static_cast<uint8_t>(((k << 3) | (k >> 5)) + 0x3Du);
+            k = static_cast<uint8_t>((k << s1_rol) | (k >> (8 - s1_rol)));
+            k = static_cast<uint8_t>(k + s1_add);
+            k ^= s1_xor;
         }
     }
 
     // -------------------------------------------------------------------------
-    // 4. Stage 1 Self-Decrypting & Self-Wiping Bootstrap at kStage1Offset (0x280)
+    // 4. Stage 1 Self-Decrypting & Self-Wiping Bootstrap at kStage1Offset (0xA80)
     // -------------------------------------------------------------------------
     {
         std::vector<uint8_t> s1;
@@ -481,8 +549,9 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
 
         const size_t lbl_s2_dec = s1.size();
         emit({0x30, 0x07});       // xor byte ptr [rdi], al
-        emit({0xC0, 0xC0, 0x03}); // rol al, 3
-        emit({0x04, 0x3D});       // add al, 0x3D
+        emit({0xC0, 0xC0, s1_rol}); // rol al, s1_rol
+        emit({0x04, s1_add});     // add al, s1_add
+        emit({0x34, s1_xor});     // xor al, s1_xor
         emit({0x48, 0xFF, 0xC7}); // inc rdi
         emit({0xFF, 0xC9});       // dec ecx
         int8_t rel_s2_dec = static_cast<int8_t>(static_cast<intptr_t>(lbl_s2_dec) - static_cast<intptr_t>(s1.size() + 2));
@@ -695,9 +764,10 @@ bool PeImage::is_already_packed(VPackHeader* out_header) const noexcept {
         return false;
     }
     if (out_header) {
+        const uint64_t morph_key = derive_morph_key(hdr->master_seed);
         *out_header = *hdr;
-        out_header->original_entry_rva ^= static_cast<uint32_t>(hdr->master_seed & 0xFFFFFFFFULL);
-        out_header->orig_tls_callback_rva ^= static_cast<uint32_t>((hdr->master_seed >> 32) & 0xFFFFFFFFULL);
+        out_header->original_entry_rva ^= static_cast<uint32_t>(morph_key & 0xFFFFFFFFULL);
+        out_header->orig_tls_callback_rva ^= static_cast<uint32_t>((morph_key >> 32) & 0xFFFFFFFFULL);
     }
     return true;
 }
@@ -791,8 +861,11 @@ PackResult PeImage::pack(const PackOptions& opts) {
 
     const uint32_t new_sec_va = align_up(max_virt_end, sec_align);
 
-    const uint32_t seed_lo = static_cast<uint32_t>(seed & 0xFFFFFFFFULL);
-    const uint32_t seed_hi = static_cast<uint32_t>((seed >> 32) & 0xFFFFFFFFULL);
+    const uint32_t seed_lo  = static_cast<uint32_t>(seed & 0xFFFFFFFFULL);
+    const uint32_t seed_hi  = static_cast<uint32_t>((seed >> 32) & 0xFFFFFFFFULL);
+    const uint64_t morph_key = derive_morph_key(seed);
+    const uint32_t morph_lo = static_cast<uint32_t>(morph_key & 0xFFFFFFFFULL);
+    const uint32_t morph_hi = static_cast<uint32_t>((morph_key >> 32) & 0xFFFFFFFFULL);
     const uint32_t orig_ep_plain = nt->OptionalHeader.AddressOfEntryPoint;
 
     VPackHeader vhdr{};
@@ -800,16 +873,16 @@ PackResult PeImage::pack(const PackOptions& opts) {
     vhdr.version              = VPACK_VERSION;
     vhdr.region_count         = 0;
     vhdr.flags                = opts.protection_flags;
-    vhdr.original_entry_rva   = orig_ep_plain ^ seed_lo;
+    vhdr.original_entry_rva   = orig_ep_plain ^ morph_lo;
     vhdr.master_seed          = seed;
     vhdr.preferred_image_base = nt->OptionalHeader.ImageBase;
-    vhdr.orig_tls_callback_rva = seed_hi; // 0 ^ seed_hi
+    vhdr.orig_tls_callback_rva = morph_hi; // 0 ^ morph_hi
     vhdr.code_reloc_count     = 0;
-    vhdr.orig_pdata_rva       = 0;
-    vhdr.orig_pdata_size      = 0;
-    vhdr.orig_import_rva      = seed_lo; // 0 ^ seed_lo
-    vhdr.vcode_rva            = seed_lo; // 0 ^ seed_lo
-    vhdr.vcode_size           = seed_hi; // 0 ^ seed_hi
+    vhdr.orig_pdata_rva       = seed_lo;   // 0 ^ seed_lo
+    vhdr.orig_pdata_size      = seed_hi;   // 0 ^ seed_hi
+    vhdr.orig_import_rva      = seed_lo;   // 0 ^ seed_lo
+    vhdr.vcode_rva            = seed_lo;   // 0 ^ seed_lo
+    vhdr.vcode_size           = seed_hi;   // 0 ^ seed_hi
     vhdr.vcode_jit_tag        = 0;
 
     for (WORD i = 0; i < num_sec; ++i) {
@@ -841,7 +914,7 @@ PackResult PeImage::pack(const PackOptions& opts) {
                     auto* cb_slot = reinterpret_cast<uint64_t*>(data_.data() + cb_off);
                     if (*cb_slot > nt->OptionalHeader.ImageBase) {
                         uint32_t tls_cb_plain = static_cast<uint32_t>(*cb_slot - nt->OptionalHeader.ImageBase);
-                        vhdr.orig_tls_callback_rva = tls_cb_plain ^ seed_hi;
+                        vhdr.orig_tls_callback_rva = tls_cb_plain ^ morph_hi;
                         *cb_slot = nt->OptionalHeader.ImageBase + new_sec_va + kTlsStubOffset;
                     }
                 }
@@ -879,7 +952,7 @@ PackResult PeImage::pack(const PackOptions& opts) {
                             rva >= range_rva &&
                             rva < range_rva + range_size) {
                             if (vhdr.code_reloc_count < VPACK_MAX_CODE_RELOCS) {
-                                vhdr.code_reloc_rvas[vhdr.code_reloc_count++] = rva;
+                                vhdr.code_reloc_rvas[vhdr.code_reloc_count++] = rva ^ morph_lo;
                                 entries[k] = 0; // Turn into IMAGE_REL_BASED_ABSOLUTE no-op for OS loader
                             }
                         }
@@ -890,7 +963,7 @@ PackResult PeImage::pack(const PackOptions& opts) {
         }
 
         uint8_t* sec_bytes  = data_.data() + sec_raw + offset_in_sec;
-        uint64_t region_key = seed ^ key_salt;
+        uint64_t region_key = crypto::poly_permute_64(seed ^ key_salt, morph_key);
         uint64_t plain_hash = crypto::fnv1a_64(sec_bytes, range_size);
 
         stub_stream_xor(sec_bytes, range_size, region_key);
@@ -898,10 +971,10 @@ PackResult PeImage::pack(const PackOptions& opts) {
         first_sec[sec_idx].Characteristics |= (IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE);
 
         VPackRegion& reg = vhdr.regions[vhdr.region_count++];
-        reg.rva        = range_rva ^ seed_lo;
-        reg.size       = range_size ^ seed_hi;
-        reg.key        = region_key;
-        reg.plain_hash = plain_hash;
+        reg.rva        = range_rva ^ morph_lo;
+        reg.size       = range_size ^ morph_hi;
+        reg.key        = region_key ^ morph_key;
+        reg.plain_hash = plain_hash ^ morph_key;
     };
 
     // Helper to encrypt a named section and add it to VPackHeader
@@ -931,8 +1004,8 @@ PackResult PeImage::pack(const PackOptions& opts) {
     if (opts.encrypt_pdata_section) {
         auto& exc_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
         if (exc_dir.VirtualAddress != 0 && exc_dir.Size != 0) {
-            vhdr.orig_pdata_rva  = exc_dir.VirtualAddress;
-            vhdr.orig_pdata_size = exc_dir.Size;
+            vhdr.orig_pdata_rva  = exc_dir.VirtualAddress ^ seed_lo;
+            vhdr.orig_pdata_size = exc_dir.Size ^ seed_hi;
             // Hide Exception Directory from static analysis tools (IDA Pro uses .pdata to find all functions)
             exc_dir.VirtualAddress = 0;
             exc_dir.Size           = 0;

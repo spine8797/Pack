@@ -4,6 +4,7 @@
 #include "vpack/crypto.h"
 #include "vpack/anti_debug.h"
 #include "vpack/anti_dump.h"
+#include "vpack/page_vault.h"
 #include "vpack/vm.h"
 #include "vpack/pe_parser.h"
 

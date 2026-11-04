@@ -79,10 +79,17 @@ void retire_page_locked(uint64_t page) noexcept {
     }
 }
 
-bool decrypt_page_locked(uint64_t page) noexcept {
+bool decrypt_page_locked(uint64_t page, uint64_t active_rip_page) noexcept {
     const uint64_t base64 = reinterpret_cast<uint64_t>(g_base);
     const size_t idx = static_cast<size_t>((page - base64) / kPageSize);
     if (idx >= g_pages) return false;
+
+    // Check if already in window
+    for (size_t i = 0; i < g_window_n; ++i) {
+        if (g_window[i] == page) {
+            return true;
+        }
+    }
 
     uint8_t* src = g_cipher + idx * kPageSize;
     DWORD old = 0;
@@ -102,12 +109,15 @@ bool decrypt_page_locked(uint64_t page) noexcept {
     VirtualProtect(reinterpret_cast<void*>(page), kPageSize,
                    PAGE_EXECUTE_READ, &old);
     VirtualProtect(src, kPageSize, PAGE_NOACCESS, &old);
+    FlushInstructionCache(GetCurrentProcess(), dst, kPageSize);
 
-    // FIFO window: day cua so, retire trang cu nhat (mu - an toan correctness)
+    // FIFO window: if full, retire the oldest page (skipping active_rip_page on cross-page straddle)
     if (g_window_n == kWindow) {
-        retire_page_locked(g_window[0]);
-        for (size_t i = 1; i < g_window_n; ++i)
+        size_t evict_idx = (g_window[0] == active_rip_page && g_window_n > 1) ? 1 : 0;
+        retire_page_locked(g_window[evict_idx]);
+        for (size_t i = evict_idx + 1; i < g_window_n; ++i) {
             g_window[i - 1] = g_window[i];
+        }
         --g_window_n;
     }
     g_window[g_window_n++] = page;
@@ -119,22 +129,27 @@ LONG CALLBACK veh(PEXCEPTION_POINTERS ex) noexcept {
         return EXCEPTION_CONTINUE_SEARCH;
     if (!g_installed) return EXCEPTION_CONTINUE_SEARCH;
 
-    const uint64_t fault = static_cast<uint64_t>(
-        ex->ExceptionRecord->ExceptionInformation[1]);
-    const uint64_t page = fault & ~static_cast<uint64_t>(kPageSize - 1);
-    const uint64_t base = reinterpret_cast<uint64_t>(g_base);
+    const ULONG_PTR access_type = ex->ExceptionRecord->ExceptionInformation[0];
+    const uint64_t  fault       = static_cast<uint64_t>(ex->ExceptionRecord->ExceptionInformation[1]);
+    const uint64_t  page        = fault & ~static_cast<uint64_t>(kPageSize - 1);
+    const uint64_t  base        = reinterpret_cast<uint64_t>(g_base);
     if (page < base || page >= base + g_size) return EXCEPTION_CONTINUE_SEARCH;
 
-    // Chi phuc vu FETCH tai chinh trang fault (RIP cung trang) -> tu choi
-    // memcpy/doc data tu code khac (scanner noi bo).
-    const uint64_t rip = static_cast<uint64_t>(ex->ContextRecord->Rip);
-    if (rip < base || rip >= base + g_size) return EXCEPTION_CONTINUE_SEARCH;
-    if ((rip & ~static_cast<uint64_t>(kPageSize - 1)) != page)
+    // Serve instruction fetch faults:
+    //  1) RIP is inside the faulting page, OR
+    //  2) RIP is at the end of the preceding page (within 15 bytes) and straddles into `page`, OR
+    //  3) Hardware DEP/NX execute fault (access_type == 8) where RIP is in the vaulted range.
+    const uint64_t rip      = static_cast<uint64_t>(ex->ContextRecord->Rip);
+    const uint64_t rip_page = rip & ~static_cast<uint64_t>(kPageSize - 1);
+    const bool same_page    = (rip_page == page);
+    const bool straddle     = (rip < page) && (rip + 16 >= page) && (rip >= base);
+    const bool exec_fault   = (access_type == 8) && (rip >= base && rip < base + g_size);
+    if (!same_page && !straddle && !exec_fault)
         return EXCEPTION_CONTINUE_SEARCH;
 
     ensure_lock();
     EnterCriticalSection(&g_cs);
-    const bool ok = decrypt_page_locked(page);
+    const bool ok = decrypt_page_locked(page, rip_page);
     LeaveCriticalSection(&g_cs);
     return ok ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -166,12 +181,22 @@ bool install(void* code_base, size_t code_size,
     std::memcpy(g_cipher, cipher, pages * kPageSize);
     g_hash = fnv1a(g_cipher, pages * kPageSize);
 
-    DWORD old = 0;
-    VirtualProtect(g_cipher, pages * kPageSize, PAGE_NOACCESS, &old);
-    VirtualProtect(code_base, pages * kPageSize, PAGE_NOACCESS, &old);
-
     g_veh = AddVectoredExceptionHandler(1, veh);
     InterlockedExchange(&g_installed, 1);
+
+    DWORD old = 0;
+    VirtualProtect(g_cipher, pages * kPageSize, PAGE_NOACCESS, &old);
+
+    // Lock pages to PAGE_NOACCESS, excluding any page that hosts the VEH handler itself
+    const uint64_t veh_page = reinterpret_cast<uint64_t>(&veh) & ~static_cast<uint64_t>(kPageSize - 1);
+    const uint64_t dec_page = reinterpret_cast<uint64_t>(&decrypt_page_locked) & ~static_cast<uint64_t>(kPageSize - 1);
+    for (size_t i = 0; i < pages; ++i) {
+        const uint64_t cur_page = base + i * kPageSize;
+        if (cur_page == veh_page || cur_page == dec_page) {
+            continue;
+        }
+        VirtualProtect(reinterpret_cast<void*>(cur_page), kPageSize, PAGE_NOACCESS, &old);
+    }
 
     LeaveCriticalSection(&g_cs);
     return true;

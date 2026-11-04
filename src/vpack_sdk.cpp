@@ -61,9 +61,11 @@ bool finalize_vpack_section_in_memory(uint32_t flags) noexcept {
                 vcode_rva   = vhdr->vcode_rva ^ seed_lo;
                 vcode_size  = vhdr->vcode_size ^ seed_hi;
 
-                if (vhdr->orig_pdata_rva != 0 && vhdr->orig_pdata_size >= sizeof(RUNTIME_FUNCTION) && fn_add_ft.get()) {
-                    auto* fn_table = reinterpret_cast<PRUNTIME_FUNCTION>(base + vhdr->orig_pdata_rva);
-                    DWORD entry_count = vhdr->orig_pdata_size / sizeof(RUNTIME_FUNCTION);
+                const uint32_t pdata_rva  = vhdr->orig_pdata_rva ^ seed_lo;
+                const uint32_t pdata_size = vhdr->orig_pdata_size ^ seed_hi;
+                if (pdata_rva != 0 && pdata_size >= sizeof(RUNTIME_FUNCTION) && fn_add_ft.get()) {
+                    auto* fn_table = reinterpret_cast<PRUNTIME_FUNCTION>(base + pdata_rva);
+                    DWORD entry_count = pdata_size / sizeof(RUNTIME_FUNCTION);
                     fn_add_ft(fn_table, entry_count, reinterpret_cast<DWORD64>(base));
                 }
             }
@@ -113,8 +115,15 @@ bool finalize_vpack_section_in_memory(uint32_t flags) noexcept {
 
     // Pass 3: Activate JIT Execute & Wipe Vault on .vcode (.sbl1) so protected functions and
     // VM handlers remain encrypted & non-executable (PAGE_READONLY) at rest in RAM!
+    // Note: When packed (found_vpack == true), Stage 2 ALREADY re-encrypted .vcode before OEP
+    // using vcode_boot_key, so init_jit_vcode_vault performs a single-pass register-only
+    // trans-encryption without ever exposing plaintext .vcode in RAM!
     if ((flags & PROT_JIT_VCODE) && vcode_rva != 0 && vcode_size != 0) {
-        antidump::init_jit_vcode_vault(base + vcode_rva, vcode_size, master_seed, false);
+        const uint64_t morph_key      = crypto::poly_permute_64(master_seed, 0x4A414E55535F4D4FULL);
+        const uint64_t vcode_boot_key = found_vpack
+            ? (master_seed ^ morph_key ^ 0x4A49545653424C31ULL)
+            : master_seed;
+        antidump::init_jit_vcode_vault(base + vcode_rva, vcode_size, vcode_boot_key, found_vpack);
     }
 
     return found_vpack;
