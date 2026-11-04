@@ -31,7 +31,7 @@ void stub_stream_xor(uint8_t* data, size_t size, uint64_t key) noexcept {
 }
 
 constexpr uint64_t derive_morph_key(uint64_t master_seed) noexcept {
-    return crypto::poly_permute_64(master_seed, 0x4A414E55535F4D4FULL);
+    return crypto::poly_permute_64(master_seed, 0xB981C7E3D52A9F47ULL);
 }
 
 constexpr uint32_t kSynthImportOffset = 0x900;
@@ -102,7 +102,7 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
     const uint64_t morph_key       = derive_morph_key(vhdr.master_seed);
     const uint32_t morph_lo        = static_cast<uint32_t>(morph_key & 0xFFFFFFFFULL);
     const uint32_t morph_hi        = static_cast<uint32_t>((morph_key >> 32) & 0xFFFFFFFFULL);
-    const uint64_t vcode_boot_salt = morph_key ^ 0x4A49545653424C31ULL;
+    const uint64_t vcode_boot_salt = morph_key ^ 0xE19B83C5D72F4A93ULL;
 
     // -------------------------------------------------------------------------
     // 1. EntryPoint Stub at kEpStubOffset (0xA00)
@@ -298,13 +298,13 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
 
         // Immediately re-encrypt .vcode (.sbl1) inside Stage 2 right after relocations so .vcode is
         // NEVER plaintext during Import Resolution, at OEP (0x105F), or during CRT startup before main()!
-        emit({0x8B, 0x8B, 0xF8, 0x08, 0x00, 0x00}); // mov ecx, dword ptr [rbx + 0x8F8] (masked vcode_size)
+        emit({0x8B, 0x8B, 0xF4, 0x08, 0x00, 0x00}); // mov ecx, dword ptr [rbx + 0x8F4] (masked vcode_size)
         emit({0x33, 0x4B, 0x14});                   // xor ecx, dword ptr [rbx + 0x14] (unmask with seed_hi)
         emit({0x85, 0xC9});                         // test ecx, ecx
         const size_t jz_skip_vcode_reenc_pos = stage2.size();
         emit({0x74, 0x00});                         // jz lbl_stage2_imports
 
-        emit({0x8B, 0x83, 0xF4, 0x08, 0x00, 0x00}); // mov eax, dword ptr [rbx + 0x8F4] (masked vcode_rva)
+        emit({0x8B, 0x83, 0xF0, 0x08, 0x00, 0x00}); // mov eax, dword ptr [rbx + 0x8F0] (masked vcode_rva)
         emit({0x33, 0x43, 0x10});                   // xor eax, dword ptr [rbx + 0x10] (unmask with seed_lo)
         emit({0x48, 0x8D, 0x3C, 0x06});             // lea rdi, [rsi + rax] (base + vcode_rva)
         emit({0x4C, 0x8B, 0x53, 0x10});             // mov r10, qword ptr [rbx + 0x10] (master_seed)
@@ -337,8 +337,8 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
         emit({0x48, 0x83, 0xE4, 0xF0}); // and rsp, -16
         emit({0x48, 0x83, 0xEC, 0x20}); // sub rsp, 0x20
 
-        // mov eax, dword ptr [rbx + 0x8F0] (masked orig_import_rva)
-        emit({0x8B, 0x83, 0xF0, 0x08, 0x00, 0x00});
+        // mov eax, dword ptr [rbx + 0x8EC] (masked orig_import_rva)
+        emit({0x8B, 0x83, 0xEC, 0x08, 0x00, 0x00});
         // xor eax, dword ptr [rbx + 0x10] (unmask with low32(master_seed))
         emit({0x33, 0x43, 0x10});
         // test eax, eax
@@ -465,9 +465,9 @@ std::vector<uint8_t> build_vpack_section_payload(const VPackHeader& vhdr, uint32
         write_i32(stage2, jz_desc_done_pos + 2, static_cast<int32_t>(lbl_imp_done - (jz_desc_done_pos + 6)));
         write_i32(stage2, jz_load_fail_pos + 2, static_cast<int32_t>(lbl_imp_done - (jz_load_fail_pos + 6)));
 
-        // Wipe orig_import_rva [rbx + 0x8F0] and the entire Synthetic Import Table [rbx + 0x900 .. 0x9A0)
+        // Wipe orig_import_rva [rbx + 0x8EC] and the entire Synthetic Import Table [rbx + 0x900 .. 0x9A0)
         // right inside Stage 2 so even at OEP (0x105F) zero import artifacts remain in .vpack!
-        emit({0xC7, 0x83, 0xF0, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); // mov dword ptr [rbx + 0x8F0], 0
+        emit({0xC7, 0x83, 0xEC, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); // mov dword ptr [rbx + 0x8EC], 0
         emit({0x48, 0x8D, 0xBB, 0x00, 0x09, 0x00, 0x00});                   // lea rdi, [rbx + 0x900]
         emit({0xB9, 0xA0, 0x00, 0x00, 0x00});                               // mov ecx, 0xA0
         emit({0x31, 0xC0});                                                 // xor eax, eax
@@ -842,7 +842,7 @@ PackResult PeImage::pack(const PackOptions& opts) {
         auto now = static_cast<uint64_t>(
             std::chrono::high_resolution_clock::now().time_since_epoch().count()
         );
-        seed = crypto::fnv1a_64(data_.data(), data_.size()) ^ now ^ 0x5341424C455F504BULL;
+        seed = crypto::fnv1a_64(data_.data(), data_.size()) ^ now ^ 0xA983C1E59F27B4D3ULL;
     }
 
     const uint32_t file_align = nt->OptionalHeader.FileAlignment;
@@ -883,20 +883,22 @@ PackResult PeImage::pack(const PackOptions& opts) {
     vhdr.orig_import_rva      = seed_lo;   // 0 ^ seed_lo
     vhdr.vcode_rva            = seed_lo;   // 0 ^ seed_lo
     vhdr.vcode_size           = seed_hi;   // 0 ^ seed_hi
-    vhdr.vcode_jit_tag        = 0;
+    vhdr.vinit_rva            = seed_lo;   // 0 ^ seed_lo
+    vhdr.vinit_size           = seed_hi;   // 0 ^ seed_hi
 
     for (WORD i = 0; i < num_sec; ++i) {
         char sname[9]{};
         std::memcpy(sname, first_sec[i].Name, 8);
+        uint32_t sec_sz = first_sec[i].Misc.VirtualSize;
+        if (sec_sz == 0 || sec_sz > first_sec[i].SizeOfRawData) {
+            sec_sz = first_sec[i].SizeOfRawData;
+        }
         if (std::strcmp(sname, ".vcode") == 0) {
-            uint32_t vc_size = first_sec[i].Misc.VirtualSize;
-            if (vc_size == 0 || vc_size > first_sec[i].SizeOfRawData) {
-                vc_size = first_sec[i].SizeOfRawData;
-            }
-            vhdr.vcode_rva     = first_sec[i].VirtualAddress ^ seed_lo;
-            vhdr.vcode_size    = vc_size ^ seed_hi;
-            vhdr.vcode_jit_tag = static_cast<uint32_t>(seed ^ 0x4A495456ULL);
-            break;
+            vhdr.vcode_rva  = first_sec[i].VirtualAddress ^ seed_lo;
+            vhdr.vcode_size = sec_sz ^ seed_hi;
+        } else if (std::strcmp(sname, ".vinit") == 0) {
+            vhdr.vinit_rva  = first_sec[i].VirtualAddress ^ seed_lo;
+            vhdr.vinit_size = sec_sz ^ seed_hi;
         }
     }
 
@@ -994,12 +996,13 @@ PackResult PeImage::pack(const PackOptions& opts) {
         }
     };
 
-    // 3. Encrypt .text, .vcode, .pdata, .xdata, and .rdata string pool
+    // 3. Encrypt .text, .vcode, .vinit, .pdata, .xdata, and .rdata string pool
     if (opts.encrypt_text_section) {
-        encrypt_section_by_name(".text", 0x544558545F4B4559ULL);
+        encrypt_section_by_name(".text", 0x91E3C5A78D2B4F19ULL);
     }
     if (opts.encrypt_vcode_section) {
         encrypt_section_by_name(".vcode", 0xA5A5F0F033CCAA55ULL);
+        encrypt_section_by_name(".vinit", 0xD39A81E5C72B4F91ULL);
     }
     if (opts.encrypt_pdata_section) {
         auto& exc_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
@@ -1010,8 +1013,8 @@ PackResult PeImage::pack(const PackOptions& opts) {
             exc_dir.VirtualAddress = 0;
             exc_dir.Size           = 0;
         }
-        encrypt_section_by_name(".pdata", 0x50444154415F4B59ULL);
-        encrypt_section_by_name(".xdata", 0x58444154415F4B59ULL);
+        encrypt_section_by_name(".pdata", 0xB583E1A9C72D4F31ULL);
+        encrypt_section_by_name(".xdata", 0xC791A3E58B2F4D73ULL);
     }
 
     // Encrypt original .idata section and redirect Import Directory to the 2-function synthetic table in .vpack
@@ -1024,7 +1027,7 @@ PackResult PeImage::pack(const PackOptions& opts) {
 
             nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress = 0;
             nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size           = 0;
-            encrypt_section_by_name(".idata", 0x49444154415F4B59ULL);
+            encrypt_section_by_name(".idata", 0xE593A1C78D2B4F61ULL);
         }
     }
 
@@ -1089,7 +1092,7 @@ PackResult PeImage::pack(const PackOptions& opts) {
             }
 
             uint32_t cur = 0;
-            uint64_t salt_counter = 0x52444154415F4B31ULL;
+            uint64_t salt_counter = 0xF381C9A5E72B4D11ULL;
             while (cur < span && vhdr.region_count < VPACK_MAX_REGIONS) {
                 while (cur < span && has_reloc[cur]) ++cur;
                 uint32_t start = cur;
@@ -1103,11 +1106,12 @@ PackResult PeImage::pack(const PackOptions& opts) {
         }
     }
 
-    // Masquerade section names so static analyzers cannot identify .vcode/.pdata/.xdata/.eh_fram
+    // Masquerade section names so static analyzers cannot identify .vcode/.vinit/.pdata/.xdata/.eh_fram
     for (WORD i = 0; i < num_sec; ++i) {
         char sname[9]{};
         std::memcpy(sname, first_sec[i].Name, 8);
         if (std::strcmp(sname, ".vcode") == 0 ||
+            std::strcmp(sname, ".vinit") == 0 ||
             std::strcmp(sname, ".pdata") == 0 ||
             std::strcmp(sname, ".xdata") == 0 ||
             std::strcmp(sname, ".idata") == 0 ||

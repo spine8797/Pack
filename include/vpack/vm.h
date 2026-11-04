@@ -84,7 +84,7 @@ constexpr uint64_t vm_splitmix64(uint64_t& state) noexcept {
 
 // Synchronizes rolling decryption key at basic-block entry / branch target offset
 constexpr VPACK_FORCEINLINE uint64_t sync_rolling_state(uint64_t seed, size_t offset) noexcept {
-    const uint64_t mix = seed ^ (static_cast<uint64_t>(offset) * 0x9E3779B97F4A7C15ULL) ^ 0x4A414E55535F564DULL;
+    const uint64_t mix = seed ^ (static_cast<uint64_t>(offset) * 0x9E3779B97F4A7C15ULL) ^ 0xC983E5A19F27B4D3ULL;
     return crypto::poly_permute_64(mix, seed ^ 0xBF58476D1CE4E5B9ULL);
 }
 
@@ -378,7 +378,7 @@ private:
 
 class BytecodeBuilder {
 public:
-    explicit BytecodeBuilder(uint64_t seed = 0x5341424C455F564DULL);
+    explicit BytecodeBuilder(uint64_t seed = 0xD8B39A17E4C28F95ULL);
 
     BytecodeBuilder& nop();
     BytecodeBuilder& mov_imm(VmReg dst, uint64_t imm);

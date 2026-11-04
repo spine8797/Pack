@@ -13,7 +13,7 @@
 // in RAM at rest, decrypted only inside VPACK_JIT_CALL and re-encrypted with a
 // mutated rolling key immediately upon return!
 VPACK_CODE uint64_t compute_protected_signature(uint64_t user_id, uint64_t salt) {
-    uint64_t state = vpack::crypto::mba_xor(user_id, 0x5341424C455F434FULL);
+    uint64_t state = vpack::crypto::mba_xor(user_id, 0xA381E5C9D72B4F19ULL);
     for (int round = 0; round < 16; ++round) {
         uint64_t rot  = (state << 11) | (state >> 53);
         uint64_t term = vpack::crypto::mba_xor(salt, static_cast<uint64_t>(round * 0x9E3779B9u));

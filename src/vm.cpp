@@ -480,7 +480,7 @@ VPACK_CODE bool h_state_matrix(VmExecState& s) noexcept {
     const uint64_t r1 = s.ctx.vreg(R1);
     const uint64_t f0 = crypto::gf2_64_mul(r1 ^ k, 0xBF58476D1CE4E5B9ULL | 1ULL);
     const uint64_t n0 = crypto::mba_xor(r0, crypto::mba_add(f0, r1 * 0x94D049BB133111EBULL));
-    const uint64_t f1 = crypto::poly_permute_64(n0, k ^ 0x5341424C45ULL);
+    const uint64_t f1 = crypto::poly_permute_64(n0, k ^ 0xE791C3A58B2D4F19ULL);
     const uint64_t n1 = crypto::mba_xor(r1, f1);
     s.ctx.vreg(R0)    = n0;
     s.ctx.vreg(R1)    = n1;
@@ -836,7 +836,15 @@ void VmEngine::register_native(uint16_t slot_id, NativeCallback fn) {
     native_table_[slot_id] = fn;
 }
 
-bool VmEngine::execute(const VmProgram& program, VmContext& ctx, uint64_t* out_return_value) const noexcept {
+namespace {
+
+VPACK_CODE bool execute_protected_vm(
+    const VmProgram& program,
+    VmContext& ctx,
+    const std::unordered_map<uint16_t, NativeCallback>& native_table,
+    bool jit_tampered,
+    uint64_t* out_return_value
+) noexcept {
     if (program.bytecode.empty()) {
         return false;
     }
@@ -858,9 +866,7 @@ bool VmEngine::execute(const VmProgram& program, VmContext& ctx, uint64_t* out_r
         code[i] ^= ephemeral_stream_byte(ephemeral_key, i);
     }
 
-    // 3. JIT-unlock and decrypt the .vcode handler section ONLY for the duration of VM execution
-    antidump::JitSectionGuard jit_guard;
-    if (jit_guard.is_tampered()) {
+    if (jit_tampered) {
         ctx.env_poison ^= 0xBAD0C0DE1337BEEFULL;
         ctx.tampered = true;
     }
@@ -923,14 +929,14 @@ bool VmEngine::execute(const VmProgram& program, VmContext& ctx, uint64_t* out_r
         runtime_ptr_mask,
         op_table,
         encrypted_handlers,
-        native_table_
+        native_table
     };
 
     ctx.ip            = 0;
     ctx.rolling_state = sync_rolling_state(program.seed, 0) ^ ctx.env_poison;
-    ctx.stack_key     = ephemeral_key ^ 0x535441434B5F4B59ULL;
+    ctx.stack_key     = ephemeral_key ^ 0xF19D83A5C7E24B19ULL;
     ctx.halted        = false;
-    ctx.tampered      = jit_guard.is_tampered();
+    ctx.tampered      = jit_tampered;
 
     const bool ok = dispatch_next(state);
 
@@ -942,6 +948,13 @@ bool VmEngine::execute(const VmProgram& program, VmContext& ctx, uint64_t* out_r
 
     crypto::secure_wipe(code.data(), code.size(), ephemeral_key);
     return ok && ctx.halted && !ctx.tampered;
+}
+
+} // namespace
+
+bool VmEngine::execute(const VmProgram& program, VmContext& ctx, uint64_t* out_return_value) const noexcept {
+    antidump::JitSectionGuard jit_guard;
+    return execute_protected_vm(program, ctx, native_table_, jit_guard.is_tampered(), out_return_value);
 }
 
 uint64_t VmEngine::run_WithArgs(

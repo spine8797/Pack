@@ -13,10 +13,13 @@ bool     Protector::headers_erased_ = false;
 
 namespace {
 
+uint8_t* g_vinit_base = nullptr;
+size_t   g_vinit_size = 0;
+
 // Registers decrypted .pdata unwind table, initializes the JIT Execute & Wipe vault for .vcode (.sbl1),
 // wipes the entire .vpack section (Stage 1, Synthetic Imports, VPackHeader) leaving only a 1-byte RET
 // at TlsStub, and restores strict RX / R section permissions so zero RWX pages remain in process memory!
-bool finalize_vpack_section_in_memory(uint32_t flags) noexcept {
+VPACK_INIT_CODE bool finalize_vpack_section_in_memory(uint32_t flags) noexcept {
     auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     if (!base) return false;
 
@@ -38,12 +41,14 @@ bool finalize_vpack_section_in_memory(uint32_t flags) noexcept {
     bool     found_vpack = false;
     uint32_t vcode_rva   = 0;
     uint32_t vcode_size  = 0;
-    uint64_t master_seed = 0x4A414E55535F4B59ULL;
+    uint32_t vinit_rva   = 0;
+    uint32_t vinit_size  = 0;
+    uint64_t master_seed = 0xB7E193C58A2F4D91ULL;
 
     const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
     const WORD num_sec = nt->FileHeader.NumberOfSections;
 
-    // Pass 1: Extract VPackHeader metadata & locate .vcode (even if masqueraded as .sbl*)
+    // Pass 1: Extract VPackHeader metadata & locate .vcode / .vinit (even if masqueraded as .sbl*)
     for (WORD i = 0; i < num_sec; ++i) {
         const auto& s = sec[i];
         uint8_t* sec_base = base + s.VirtualAddress;
@@ -60,6 +65,8 @@ bool finalize_vpack_section_in_memory(uint32_t flags) noexcept {
                 master_seed = vhdr->master_seed;
                 vcode_rva   = vhdr->vcode_rva ^ seed_lo;
                 vcode_size  = vhdr->vcode_size ^ seed_hi;
+                vinit_rva   = vhdr->vinit_rva ^ seed_lo;
+                vinit_size  = vhdr->vinit_size ^ seed_hi;
 
                 const uint32_t pdata_rva  = vhdr->orig_pdata_rva ^ seed_lo;
                 const uint32_t pdata_size = vhdr->orig_pdata_size ^ seed_hi;
@@ -85,7 +92,15 @@ bool finalize_vpack_section_in_memory(uint32_t flags) noexcept {
         } else if (std::memcmp(s.Name, ".vcode", 6) == 0 && vcode_rva == 0) {
             vcode_rva  = s.VirtualAddress;
             vcode_size = static_cast<uint32_t>(sec_size);
+        } else if (std::memcmp(s.Name, ".vinit", 6) == 0 && vinit_rva == 0) {
+            vinit_rva  = s.VirtualAddress;
+            vinit_size = static_cast<uint32_t>(sec_size);
         }
+    }
+
+    if (vinit_rva != 0 && vinit_size != 0) {
+        g_vinit_base = base + vinit_rva;
+        g_vinit_size = vinit_size;
     }
 
     // Pass 2: Restore strict non-writable permissions on code (.text) and read-only (.rdata, .pdata, .xdata, .idata)
@@ -119,9 +134,9 @@ bool finalize_vpack_section_in_memory(uint32_t flags) noexcept {
     // using vcode_boot_key, so init_jit_vcode_vault performs a single-pass register-only
     // trans-encryption without ever exposing plaintext .vcode in RAM!
     if ((flags & PROT_JIT_VCODE) && vcode_rva != 0 && vcode_size != 0) {
-        const uint64_t morph_key      = crypto::poly_permute_64(master_seed, 0x4A414E55535F4D4FULL);
+        const uint64_t morph_key      = crypto::poly_permute_64(master_seed, 0xB981C7E3D52A9F47ULL);
         const uint64_t vcode_boot_key = found_vpack
-            ? (master_seed ^ morph_key ^ 0x4A49545653424C31ULL)
+            ? (master_seed ^ morph_key ^ 0xE19B83C5D72F4A93ULL)
             : master_seed;
         antidump::init_jit_vcode_vault(base + vcode_rva, vcode_size, vcode_boot_key, found_vpack);
     }
@@ -159,6 +174,14 @@ RuntimeStatus Protector::initialize(uint32_t flags) noexcept {
 
     if ((flags & PROT_ANTI_DUMP) && !headers_erased_) {
         headers_erased_ = antidump::erase_pe_headers(nullptr);
+    }
+
+    // Wipe and lock the one-shot .vinit section (finalize_vpack_section_in_memory, init_jit_vcode_vault,
+    // erase_pe_headers, tamper_peb_image_size, capture_module_baseline) to PAGE_NOACCESS (?? ??)!
+    if (g_vinit_base && g_vinit_size > 0) {
+        antidump::wipe_and_lock_vinit_section(g_vinit_base, g_vinit_size);
+        g_vinit_base = nullptr;
+        g_vinit_size = 0;
     }
 
     status.initialized = true;

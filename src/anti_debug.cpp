@@ -249,7 +249,7 @@ bool check_timing_anomaly(uint64_t threshold_cycles, uint64_t* out_delta) noexce
     uint64_t kt1 = *kuser_time;
     uint64_t t1  = __rdtsc();
 
-    volatile uint64_t acc = 0x5341424C45ULL;
+    volatile uint64_t acc = 0xE791C3A58B2D4F19ULL;
     for (int i = 0; i < 64; ++i) {
         acc = crypto::mba_xor(acc, static_cast<uint64_t>(i)) * 0x100000001B3ULL;
     }
@@ -303,7 +303,7 @@ uint64_t compute_environmental_key_poison() noexcept {
     uintptr_t debug_port = 0;
     bool hooked = false;
     if (call_nt_query_info_process(GetCurrentProcess(), 0x07, &debug_port, sizeof(debug_port), nullptr, &hooked) == 0) {
-        poison = crypto::mba_xor(poison, static_cast<uint64_t>(debug_port) * 0x5341424C455F564DULL);
+        poison = crypto::mba_xor(poison, static_cast<uint64_t>(debug_port) * 0xD8B39A17E4C28F95ULL);
     }
     if (hooked) {
         poison ^= 0xDEAD10CCBAD0F00DULL;

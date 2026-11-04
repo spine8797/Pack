@@ -116,7 +116,7 @@ void release_jit_lock() noexcept {
 
 // Fast GF(2^64) + Non-Linear MBA stream cipher for in-memory JIT code pages
 void jit_mba_stream_transform(uint8_t* buf, size_t size, uint64_t key) noexcept {
-    uint64_t state = crypto::mba_xor(key, 0x4A414E55535F564DULL);
+    uint64_t state = crypto::mba_xor(key, 0xC983E5A19F27B4D3ULL);
     size_t words = size / 8;
     auto* wptr = reinterpret_cast<uint64_t*>(buf);
     for (size_t i = 0; i < words; ++i) {
@@ -133,8 +133,8 @@ void jit_mba_stream_transform(uint8_t* buf, size_t size, uint64_t key) noexcept 
 // Homomorphic Ciphertext-to-Ciphertext Re-Keying: transitions .vcode directly from
 // Stream(old_key) to Stream(new_key) via XOR delta WITHOUT ever exposing plaintext in RAM!
 void jit_mba_homomorphic_rekey(uint8_t* buf, size_t size, uint64_t old_key, uint64_t new_key) noexcept {
-    uint64_t s_old = crypto::mba_xor(old_key, 0x4A414E55535F564DULL);
-    uint64_t s_new = crypto::mba_xor(new_key, 0x4A414E55535F564DULL);
+    uint64_t s_old = crypto::mba_xor(old_key, 0xC983E5A19F27B4D3ULL);
+    uint64_t s_new = crypto::mba_xor(new_key, 0xC983E5A19F27B4D3ULL);
     size_t words = size / 8;
     auto* wptr = reinterpret_cast<uint64_t*>(buf);
     for (size_t i = 0; i < words; ++i) {
@@ -317,7 +317,7 @@ bool detect_ntdll_inline_hooks() noexcept {
     return false;
 }
 
-bool init_jit_vcode_vault(
+VPACK_INIT_CODE bool init_jit_vcode_vault(
     uint8_t* vcode_base,
     size_t   vcode_size,
     uint64_t boot_key,
@@ -340,7 +340,7 @@ bool init_jit_vcode_vault(
     // Derive initial ephemeral rolling key from RDTSC + KUSER_SHARED_DATA + boot_key
     g_vcode_rolling_key = crypto::poly_permute_64(
         __rdtsc() ^ read_kuser_interrupt_time() ^ boot_key,
-        boot_key ^ 0x4A414E55535F4B59ULL
+        boot_key ^ 0xB7E193C58A2F4D91ULL
     );
 
     // Single-pass register-only trans-encryption:
@@ -348,7 +348,7 @@ bool init_jit_vcode_vault(
     // while computing g_vcode_plain_hash in CPU registers so plaintext .vcode NEVER sits in RAM!
     uint64_t fnv_hash  = 0xCBF29CE484222325ULL;
     uint64_t stub_r10  = boot_key;
-    uint64_t jit_state = crypto::mba_xor(g_vcode_rolling_key, 0x4A414E55535F564DULL);
+    uint64_t jit_state = crypto::mba_xor(g_vcode_rolling_key, 0xC983E5A19F27B4D3ULL);
 
     size_t words = vcode_size / 8;
     auto*  wptr  = reinterpret_cast<uint64_t*>(vcode_base);
@@ -457,6 +457,17 @@ uint64_t vcode_jit_generation() noexcept {
 
 bool is_vcode_jit_active() noexcept {
     return g_vcode_jit_active.load(std::memory_order_acquire);
+}
+
+bool wipe_and_lock_vinit_section(uint8_t* vinit_base, size_t vinit_size) noexcept {
+    if (!vinit_base || vinit_size == 0) return false;
+    DWORD old_prot = 0;
+    if (!protect_memory_via_syscall(vinit_base, vinit_size, PAGE_READWRITE, &old_prot)) {
+        return false;
+    }
+    crypto::secure_wipe(vinit_base, vinit_size, 0xE3A985C1D72B4F89ULL ^ __rdtsc());
+    protect_memory_via_syscall(vinit_base, vinit_size, PAGE_NOACCESS, &old_prot);
+    return true;
 }
 
 JitSectionGuard::JitSectionGuard() noexcept {
@@ -583,7 +594,7 @@ bool verify_text_integrity(uint64_t expected_hash, void* module_base) noexcept {
     return compute_text_integrity(module_base) == expected_hash && verify_vcode_integrity();
 }
 
-bool erase_pe_headers(void* module_base) noexcept {
+VPACK_INIT_CODE bool erase_pe_headers(void* module_base) noexcept {
     if (!module_base) {
         module_base = reinterpret_cast<void*>(GetModuleHandleW(nullptr));
     }
@@ -614,14 +625,14 @@ bool erase_pe_headers(void* module_base) noexcept {
     }
 
     // Wipe 100% of DOS header, DOS stub, NT Headers (FileHeader + OptionalHeader + DataDirectories), and Section headers
-    crypto::secure_wipe(base, header_size, 0x5345435F57495045ULL);
+    crypto::secure_wipe(base, header_size, 0xE3A985C1D72B4F89ULL);
 
     DWORD dummy = 0;
     protect_memory_via_syscall(base, header_size, old_protect, &dummy);
     return true;
 }
 
-bool tamper_peb_image_size(uint32_t fake_size_delta) noexcept {
+VPACK_INIT_CODE bool tamper_peb_image_size(uint32_t fake_size_delta) noexcept {
     uint8_t* peb = get_peb_mutable();
     if (!peb) return false;
 
@@ -642,7 +653,7 @@ bool tamper_peb_image_size(uint32_t fake_size_delta) noexcept {
     return true;
 }
 
-uint32_t capture_module_baseline() noexcept {
+VPACK_INIT_CODE uint32_t capture_module_baseline() noexcept {
     g_baseline_module_count = 0;
     uint8_t* peb = get_peb_mutable();
     if (!peb) return 0;

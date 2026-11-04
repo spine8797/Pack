@@ -7,15 +7,19 @@
     #define VPACK_NOINLINE __declspec(noinline)
     #define VPACK_FORCEINLINE __forceinline
     #pragma section(".vcode", execute, read, write)
+    #pragma section(".vinit", execute, read, write)
     #define VPACK_CODE __declspec(code_seg(".vcode")) VPACK_NOINLINE
+    #define VPACK_INIT_CODE __declspec(code_seg(".vinit")) VPACK_NOINLINE
 #elif defined(__GNUC__) || defined(__clang__)
     #define VPACK_NOINLINE __attribute__((noinline))
     #define VPACK_FORCEINLINE __attribute__((always_inline)) inline
     #define VPACK_CODE __attribute__((section(".vcode"), noinline, used))
+    #define VPACK_INIT_CODE __attribute__((section(".vinit"), noinline, used))
 #else
     #define VPACK_NOINLINE
     #define VPACK_FORCEINLINE inline
     #define VPACK_CODE
+    #define VPACK_INIT_CODE
 #endif
 
 namespace vpack {
@@ -23,7 +27,7 @@ namespace vpack {
 constexpr uint32_t VPACK_MAGIC           = 0x4B435056; // "VPCK"
 constexpr uint16_t VPACK_VERSION         = 0x0200;
 constexpr size_t   VPACK_MAX_REGIONS     = 24;
-constexpr size_t   VPACK_MAX_CODE_RELOCS = 416;
+constexpr size_t   VPACK_MAX_CODE_RELOCS = 415;
 
 enum ProtectionFlags : uint32_t {
     PROT_NONE               = 0,
@@ -63,11 +67,12 @@ struct VPackHeader {
     uint32_t    orig_pdata_rva;         // 0x28
     uint32_t    orig_pdata_size;        // 0x2C
     VPackRegion regions[VPACK_MAX_REGIONS];               // 0x30 .. 0x270
-    uint32_t    code_reloc_rvas[VPACK_MAX_CODE_RELOCS];   // 0x270 .. 0x8F0
-    uint32_t    orig_import_rva;                          // 0x8F0
-    uint32_t    vcode_rva;                                // 0x8F4 (masked with low32(master_seed))
-    uint32_t    vcode_size;                               // 0x8F8 (masked with high32(master_seed))
-    uint32_t    vcode_jit_tag;                            // 0x8FC
+    uint32_t    code_reloc_rvas[VPACK_MAX_CODE_RELOCS];   // 0x270 .. 0x8EC
+    uint32_t    orig_import_rva;                          // 0x8EC
+    uint32_t    vcode_rva;                                // 0x8F0 (masked with low32(master_seed))
+    uint32_t    vcode_size;                               // 0x8F4 (masked with high32(master_seed))
+    uint32_t    vinit_rva;                                // 0x8F8 (masked with low32(master_seed))
+    uint32_t    vinit_size;                               // 0x8FC (masked with high32(master_seed))
 };
 #pragma pack(pop)
 

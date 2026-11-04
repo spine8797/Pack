@@ -18,7 +18,7 @@ namespace {
 // payload, NOR any BytecodeBuilder function calls ever exist in the binary!
 // ============================================================================
 constexpr uint64_t compile_time_k1(const char* str, size_t len) noexcept {
-    uint64_t k1 = 0x5341424C455F3236ULL;
+    uint64_t k1 = 0x8F91D3A5C7E24B19ULL;
     for (size_t i = 0; i < len; ++i) {
         k1 = ((k1 << 7) | (k1 >> 57)) ^
              (static_cast<uint64_t>(static_cast<uint8_t>(str[i])) * 0x9E3779B97F4A7C15ULL);
@@ -41,7 +41,7 @@ constexpr uint64_t compile_time_vm_schedule(uint64_t r0, uint64_t r1) noexcept {
         const uint64_t k  = static_cast<uint64_t>(0x5Au) * 0x9E3779B97F4A7C15ULL;
         const uint64_t f0 = vpack::crypto::gf2_64_mul(r1 ^ k, 0xBF58476D1CE4E5B9ULL | 1ULL);
         const uint64_t n0 = vpack::crypto::mba_xor(r0, vpack::crypto::mba_add(f0, r1 * 0x94D049BB133111EBULL));
-        const uint64_t f1 = vpack::crypto::poly_permute_64(n0, k ^ 0x5341424C45ULL);
+        const uint64_t f1 = vpack::crypto::poly_permute_64(n0, k ^ 0xE791C3A58B2D4F19ULL);
         const uint64_t n1 = vpack::crypto::mba_xor(r1, f1);
         r0 = n0;
         r1 = n1;
@@ -84,7 +84,7 @@ static constexpr CompileTimeVault kVault(
 // ============================================================================
 constexpr auto build_constexpr_key_vm() noexcept {
     using namespace vpack::vm;
-    ConstexprVmBuilder<256> b(0x4A414E55535F3236ULL);
+    ConstexprVmBuilder<256> b(0x9C81E5A3D72B4F19ULL);
 
     b.anti_debug_check()
      .entangle_env(R0)                       // Silent environmental key poison (PEB + KUSER + Syscall DebugPort)
@@ -143,7 +143,7 @@ VPACK_CODE bool try_unlock_loader_vault(
 
     // 2. Compute input key material (k0, k1) with Non-Linear MBA
     const uint64_t k0 = vpack::crypto::fnv1a_64(user_key.data(), user_key.size());
-    uint64_t k1 = 0x5341424C455F3236ULL;
+    uint64_t k1 = 0x8F91D3A5C7E24B19ULL;
     for (size_t i = 0; i < user_key.size(); ++i) {
         uint64_t rot = (k1 << 7) | (k1 >> 57);
         uint64_t term = static_cast<uint64_t>(static_cast<uint8_t>(user_key[i])) * 0x9E3779B97F4A7C15ULL;

@@ -39,7 +39,7 @@ uint64_t fnv1a_64_ci(const char* str) noexcept {
 }
 
 void rolling_encrypt(uint8_t* buffer, size_t size, uint64_t key) noexcept {
-    uint64_t state = key ^ 0x7361626C655F766DULL;
+    uint64_t state = key ^ 0xD8B39A17E4C28F95ULL;
     for (size_t i = 0; i < size; ++i) {
         state = mba_add(rotl64(state, 13), 0x9E3779B97F4A7C15ULL);
         uint8_t kbyte = static_cast<uint8_t>(mba_xor(state, state >> 29) & 0xFFULL);
@@ -51,7 +51,7 @@ void rolling_encrypt(uint8_t* buffer, size_t size, uint64_t key) noexcept {
 }
 
 void rolling_decrypt(uint8_t* buffer, size_t size, uint64_t key) noexcept {
-    uint64_t state = key ^ 0x7361626C655F766DULL;
+    uint64_t state = key ^ 0xD8B39A17E4C28F95ULL;
     for (size_t i = 0; i < size; ++i) {
         state = mba_add(rotl64(state, 13), 0x9E3779B97F4A7C15ULL);
         uint8_t kbyte = static_cast<uint8_t>(mba_xor(state, state >> 29) & 0xFFULL);

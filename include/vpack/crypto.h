@@ -69,7 +69,7 @@ constexpr VPACK_FORCEINLINE uint64_t mba_sub(uint64_t x, uint64_t y) noexcept {
 constexpr VPACK_FORCEINLINE uint64_t mba_xor(uint64_t x, uint64_t y) noexcept {
     const uint64_t x1 = (x | y) - (x & y);
     const uint64_t x2 = (x + y) - ((x & y) << 1);
-    const uint64_t nl_sel = ((x + 0x94D049BB133111EBULL) * (y ^ 0x5341424C45ULL));
+    const uint64_t nl_sel = ((x + 0x94D049BB133111EBULL) * (y ^ 0xE791C3A58B2D4F19ULL));
     return (x1 & nl_sel) | (x2 & ~nl_sel);
 }
 
@@ -80,7 +80,7 @@ constexpr VPACK_FORCEINLINE uint64_t poly_permute_64(uint64_t x, uint64_t key) n
     const uint64_t x3  = x2 * x;
     const uint64_t odd = (key << 1) | 1ULL;
     const uint64_t t   = mba_add((x3 << 2) + (x2 << 1), x * odd);
-    return mba_xor(t, key ^ 0x7361626C655F766DULL);
+    return mba_xor(t, key ^ 0xD8B39A17E4C28F95ULL);
 }
 
 // Hybrid GF(2^64) + Z_{2^64} Polynomial Stream Byte (used for Synthesize & Wipe strings and VM)
