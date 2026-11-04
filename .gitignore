@@ -1,0 +1,23 @@
+# Excluded directories
+emu/
+tests/
+build/
+Bin/
+.vs/
+.vscode/
+
+# Binary and intermediate artifacts
+*.exe
+*.dll
+*.lib
+*.a
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.bin
+*.i64
+*.idb
+*.rar
+*.zip
