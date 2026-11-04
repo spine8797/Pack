@@ -36,6 +36,7 @@ add_library(vpack STATIC
     src/crypto.cpp
     src/anti_debug.cpp
     src/anti_dump.cpp
+    src/page_vault.cpp
     src/vm.cpp
     src/pe_parser.cpp
     src/vpack_sdk.cpp
