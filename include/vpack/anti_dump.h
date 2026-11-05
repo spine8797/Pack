@@ -25,14 +25,14 @@ struct SyscallEntry {
 
 bool query_module_layout(void* module_base, ModuleLayoutInfo& out_info) noexcept;
 
-bool erase_pe_headers(void* module_base = nullptr) noexcept;
+VPACK_INIT_CODE bool erase_pe_headers(void* module_base = nullptr) noexcept;
 
-bool tamper_peb_image_size(uint32_t fake_size_delta = 0x01000000u) noexcept;
+VPACK_INIT_CODE bool tamper_peb_image_size(uint32_t fake_size_delta = 0x01000000u) noexcept;
 
 uint64_t compute_text_integrity(void* module_base = nullptr) noexcept;
 bool verify_text_integrity(uint64_t expected_hash, void* module_base = nullptr) noexcept;
 
-uint32_t capture_module_baseline() noexcept;
+VPACK_INIT_CODE uint32_t capture_module_baseline() noexcept;
 bool detect_injected_module(void** out_base = nullptr, char* out_name = nullptr, size_t max_len = 0) noexcept;
 
 void* resolve_export_by_hash(uint64_t module_hash_ci, uint64_t proc_hash_ci) noexcept;
@@ -59,7 +59,7 @@ bool detect_ntdll_inline_hooks() noexcept;
 // during active function execution and re-encrypts with a mutated rolling key
 // immediately upon return.
 // ============================================================================
-bool init_jit_vcode_vault(
+VPACK_INIT_CODE bool init_jit_vcode_vault(
     uint8_t* vcode_base,
     size_t   vcode_size,
     uint64_t boot_key,

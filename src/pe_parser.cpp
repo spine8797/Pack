@@ -980,10 +980,12 @@ PackResult PeImage::pack(const PackOptions& opts) {
         reg.plain_hash = plain_hash ^ morph_key;
     };
 
-    // Helper to encrypt a named section and add it to VPackHeader
-    auto encrypt_section_by_name = [&](const char* target_name, uint64_t key_salt) {
-        if (vhdr.region_count >= VPACK_MAX_REGIONS) return;
+    // Helper to encrypt every section matching a name. MSVC can emit multiple
+    // .vcode sections when code_seg COMDAT groups receive different attributes;
+    // decrypting only the first one leaves the selected JIT vault section corrupted.
+    auto encrypt_sections_by_name = [&](const char* target_name, uint64_t key_salt) {
         for (WORD i = 0; i < num_sec; ++i) {
+            if (vhdr.region_count >= VPACK_MAX_REGIONS) return;
             char sname[9]{};
             std::memcpy(sname, first_sec[i].Name, 8);
             if (std::strcmp(sname, target_name) == 0) {
@@ -992,9 +994,11 @@ PackResult PeImage::pack(const PackOptions& opts) {
                     enc_size = first_sec[i].SizeOfRawData;
                 }
                 encrypt_section_range(i, first_sec[i].VirtualAddress, enc_size, key_salt);
-                break;
             }
         }
+    };
+    auto encrypt_section_by_name = [&](const char* target_name, uint64_t key_salt) {
+        encrypt_sections_by_name(target_name, key_salt);
     };
 
     // 3. Use .pdata (RUNTIME_FUNCTION) exact function boundaries to replace all inter-function

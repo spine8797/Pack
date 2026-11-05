@@ -117,7 +117,12 @@ VPACK_INIT_CODE bool finalize_vpack_section_in_memory(uint32_t flags) noexcept {
 
         if (fn_vprotect.get()) {
             DWORD old_prot = 0;
-            if (s.Characteristics & IMAGE_SCN_CNT_CODE) {
+            const bool is_vinit_section =
+                vinit_rva != 0 && s.VirtualAddress == vinit_rva;
+            const bool executable_section =
+                (s.Characteristics & IMAGE_SCN_MEM_EXECUTE) || is_vinit_section;
+
+            if (executable_section) {
                 // Convert RWX -> RX (PAGE_EXECUTE_READ)
                 fn_vprotect(sec_base, sec_size, PAGE_EXECUTE_READ, &old_prot);
             } else if (std::memcmp(s.Name, ".rdata", 6) == 0 ||
