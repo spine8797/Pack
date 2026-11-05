@@ -1,4 +1,5 @@
 #include "vpack/pe_parser.h"
+#include "vpack/virtualizer.h"
 #include "vpack/crypto.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1039,6 +1040,94 @@ PackResult PeImage::pack(const PackOptions& opts) {
                     }
                 }
             }
+        }
+    }
+
+    // 3b. Pack-Time AOT x86_64-to-VM Lifter & On-Disk Native Code Shredder:
+    //     Scans .data for AotVirtualSlotRaw entries, lifts the target x86_64 function into
+    //     Polymorphic MBA VM bytecode, embeds the encrypted bytecode into the slot, and
+    //     PERMANENTLY SHREDS the native x86_64 instructions ON DISK (replacing them with
+    //     `E9 <rel32 to vm_slot_thunk>; 0F 0B; <polymorphic noise>`) BEFORE encrypting sections!
+    {
+        const uint64_t img_base = nt->OptionalHeader.ImageBase;
+        for (WORD i = 0; i < num_sec; ++i) {
+            char sname[9]{};
+            std::memcpy(sname, first_sec[i].Name, 8);
+            if (std::strcmp(sname, ".data") != 0) continue;
+
+            const uint32_t sec_raw  = first_sec[i].PointerToRawData;
+            const uint32_t sec_size = first_sec[i].SizeOfRawData;
+            if (sec_raw + sec_size > data_.size() || sec_size < sizeof(virtualizer::AotVirtualSlotRaw)) {
+                break;
+            }
+
+            for (uint32_t off = 0; off + sizeof(virtualizer::AotVirtualSlotRaw) <= sec_size; off += 8) {
+                auto* slot = reinterpret_cast<virtualizer::AotVirtualSlotRaw*>(data_.data() + sec_raw + off);
+                if (slot->magic != virtualizer::kAotSlotMagic || slot->pre_lifted != 0) {
+                    continue;
+                }
+                if (slot->target_fn_va <= img_base || slot->thunk_fn_va <= img_base) {
+                    continue;
+                }
+
+                const uint32_t target_rva = static_cast<uint32_t>(slot->target_fn_va - img_base);
+                const uint32_t thunk_rva  = static_cast<uint32_t>(slot->thunk_fn_va - img_base);
+                uint32_t target_file_off  = 0;
+                if (!rva_to_file_offset(target_rva, target_file_off) || target_file_off + 16 > data_.size()) {
+                    continue;
+                }
+
+                const size_t max_scan = (data_.size() - target_file_off < 2048)
+                    ? (data_.size() - target_file_off)
+                    : 2048;
+
+                vm::VmProgram prog{};
+                size_t native_size   = 0;
+                size_t decoded_insns = 0;
+                const uint64_t aot_seed = crypto::poly_permute_64(seed ^ target_rva, 0x9F81E3A5C72B4D19ULL);
+
+                if (virtualizer::lift_x64_function(
+                        data_.data() + target_file_off,
+                        max_scan,
+                        aot_seed,
+                        prog,
+                        &native_size,
+                        &decoded_insns) &&
+                    native_size >= 7 &&
+                    prog.bytecode.size() <= sizeof(slot->bytecode)) {
+
+                    slot->magic            = aot_seed ^ 0xA5A55A5A9E3779B9ULL;
+                    slot->pre_lifted       = 1;
+                    slot->bytecode_size    = static_cast<uint32_t>(prog.bytecode.size());
+                    slot->vm_seed          = prog.seed;
+                    slot->integrity_tag    = prog.integrity_tag;
+                    slot->native_code_size = static_cast<uint32_t>(native_size);
+                    slot->decoded_insns    = static_cast<uint32_t>(decoded_insns);
+
+                    for (size_t b = 0; b < prog.bytecode.size(); ++b) {
+                        const uint8_t mask = static_cast<uint8_t>(((prog.seed >> ((b & 7u) * 8u)) & 0xFFu) ^ 0xA5u);
+                        slot->bytecode[b]  = static_cast<uint8_t>(prog.bytecode[b] ^ mask);
+                    }
+
+                    // Overwrite native x86_64 function ON DISK with 5-byte RIP-relative jump
+                    // to vm_slot_thunk + UD2 (0F 0B) + high-entropy polymorphic noise!
+                    uint8_t* fn_disk = data_.data() + target_file_off;
+                    const int32_t rel_jmp = static_cast<int32_t>(thunk_rva) - static_cast<int32_t>(target_rva + 5);
+                    fn_disk[0] = 0xE9;
+                    for (int b = 0; b < 4; ++b) {
+                        fn_disk[1 + b] = static_cast<uint8_t>((rel_jmp >> (b * 8)) & 0xFFu);
+                    }
+                    fn_disk[5] = 0x0F;
+                    fn_disk[6] = 0x0B;
+
+                    uint64_t noise = aot_seed ^ 0xD8B39A17E4C28F95ULL;
+                    for (size_t b = 7; b < native_size; ++b) {
+                        noise = crypto::poly_permute_64(noise, b ^ 0x9E3779B97F4A7C15ULL);
+                        fn_disk[b] = static_cast<uint8_t>((noise ^ (noise >> 23)) & 0xFFu);
+                    }
+                }
+            }
+            break;
         }
     }
 

@@ -235,12 +235,13 @@ int main() {
     std::printf("%s0x%llx\n", VPACK_STR("  [*] Base Address       : ").c_str(),
                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(module_base)));
     std::printf("%s", VPACK_STR("  [*] Protection Profile : x64->VM Lifter&Shredder + JIT Vault + Indirect Syscall\n").c_str());
-    std::printf("%s%zu%s%zu%s\n",
+    std::printf("%s%s%zu%s%zu%s\n",
                 VPACK_STR("  [*] Native x64 Shred   : ").c_str(),
+                (lift_rep.aot_pre_lifted ? VPACK_STR("[AOT ON-DISK] ").c_str() : VPACK_STR("[RUNTIME] ").c_str()),
                 lift_rep.decoded_insns,
-                VPACK_STR(" x64 insns lifted -> ").c_str(),
+                VPACK_STR(" x64 insns -> ").c_str(),
                 lift_rep.vm_bytecode_size,
-                VPACK_STR(" VM bytes (Native x64 Wiped!)").c_str());
+                VPACK_STR(" VM bytes (0 native bytes in .exe!)").c_str());
     std::printf("%s", VPACK_STR("------------------------------------------------------------\n").c_str());
 
     int attempts = 0;

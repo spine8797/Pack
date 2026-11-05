@@ -26,13 +26,6 @@ struct VirtualizedSlot {
 
 VirtualizedSlot g_slots[kMaxVirtualizedSlots]{};
 
-template <uint16_t Slot>
-uint64_t vm_slot_thunk(uint64_t rcx_arg, uint64_t rdx_arg, uint64_t r8_arg, uint64_t r9_arg) noexcept {
-    return execute_lifted_slot(Slot, rcx_arg, rdx_arg, r8_arg, r9_arg);
-}
-
-using ThunkFnPtr = uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t) noexcept;
-
 constexpr ThunkFnPtr kSlotThunks[kMaxVirtualizedSlots] = {
     &vm_slot_thunk<0>,  &vm_slot_thunk<1>,  &vm_slot_thunk<2>,  &vm_slot_thunk<3>,
     &vm_slot_thunk<4>,  &vm_slot_thunk<5>,  &vm_slot_thunk<6>,  &vm_slot_thunk<7>,
@@ -897,6 +890,7 @@ LiftReport virtualize_and_shred(
         rep.slot_id          = slot_id;
         rep.vm_seed          = prog.seed;
         rep.native_shredded  = true;
+        rep.aot_pre_lifted   = false;
 
         g_slots[slot_id].occupied = true;
         g_slots[slot_id].report   = rep;
@@ -904,6 +898,53 @@ LiftReport virtualize_and_shred(
     }
 
     return rep;
+}
+
+LiftReport activate_aot_or_runtime_slot(AotVirtualSlotRaw* raw_slot) noexcept {
+    if (!raw_slot) return LiftReport{};
+
+    if (raw_slot->pre_lifted == 2) {
+        const uint16_t sid = (raw_slot->slot_id < kMaxVirtualizedSlots) ? raw_slot->slot_id : 0;
+        return g_slots[sid].report;
+    }
+
+    if (raw_slot->pre_lifted == 1 && raw_slot->bytecode_size > 0 &&
+        raw_slot->bytecode_size <= sizeof(raw_slot->bytecode)) {
+        const uint16_t sid = (raw_slot->slot_id < kMaxVirtualizedSlots) ? raw_slot->slot_id : 0;
+
+        vm::VmProgram prog{};
+        prog.seed          = raw_slot->vm_seed;
+        prog.integrity_tag = raw_slot->integrity_tag;
+        prog.bytecode.resize(raw_slot->bytecode_size);
+
+        for (uint32_t i = 0; i < raw_slot->bytecode_size; ++i) {
+            const uint8_t mask = static_cast<uint8_t>(((raw_slot->vm_seed >> ((i & 7u) * 8u)) & 0xFFu) ^ 0xA5u);
+            prog.bytecode[i]   = static_cast<uint8_t>(raw_slot->bytecode[i] ^ mask);
+        }
+
+        // Scrub the AOT bytecode buffer from .data in RAM after loading into the VM slot
+        crypto::secure_wipe(raw_slot->bytecode, sizeof(raw_slot->bytecode), raw_slot->vm_seed);
+        raw_slot->pre_lifted = 2;
+
+        LiftReport rep{};
+        rep.success          = true;
+        rep.function_address = reinterpret_cast<void*>(raw_slot->target_fn_va);
+        rep.native_code_size = raw_slot->native_code_size;
+        rep.decoded_insns    = raw_slot->decoded_insns;
+        rep.vm_bytecode_size = prog.bytecode.size();
+        rep.slot_id          = sid;
+        rep.vm_seed          = prog.seed;
+        rep.native_shredded  = true;
+        rep.aot_pre_lifted   = true;
+
+        g_slots[sid].occupied = true;
+        g_slots[sid].report   = rep;
+        g_slots[sid].program  = std::move(prog);
+        return rep;
+    }
+
+    // Fallback for unpacked dev binary: lift and shred at runtime
+    return virtualize_and_shred(reinterpret_cast<void*>(raw_slot->target_fn_va));
 }
 
 bool is_function_virtualized(const void* fn_address, LiftReport* out_report) noexcept {

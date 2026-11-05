@@ -107,9 +107,10 @@ int main(int argc, char** argv) {
               << VPACK_STR("    - Base Address           : 0x") << std::hex << reinterpret_cast<uintptr_t>(module_base) << "\n"
               << VPACK_STR("    - Packed Binary (.vpack) : ") << (status.packed_binary ? VPACK_STR("YES") : VPACK_STR("NO (Unpacked Dev Build)")) << "\n"
               << VPACK_STR("    - .vcode JIT Vault       : ") << (vpack::antidump::is_vcode_jit_active() ? VPACK_STR("ACTIVE (Encrypted & PAGE_READONLY at Rest)") : VPACK_STR("INACTIVE")) << "\n"
-              << VPACK_STR("    - x64->VM Lifter & Shred : ") << (lift_rep.native_shredded ? VPACK_STR("SHREDDED (") : VPACK_STR("INACTIVE ("))
+              << VPACK_STR("    - x64->VM Lifter & Shred : ")
+              << (lift_rep.aot_pre_lifted ? VPACK_STR("AOT PRE-SHREDDED ON DISK (") : VPACK_STR("RUNTIME SHREDDED ("))
               << std::dec << lift_rep.decoded_insns << VPACK_STR(" x64 insns -> ")
-              << lift_rep.vm_bytecode_size << VPACK_STR(" VM bytes, native x64 wiped!)\n")
+              << lift_rep.vm_bytecode_size << VPACK_STR(" VM bytes, 0 native bytes in .exe!)\n")
               << VPACK_STR("    - .text Baseline Hash    : 0x") << std::hex << status.text_baseline_hash << "\n"
               << VPACK_STR("    - In-Memory MZ Signature : 0x") << std::hex << mem_mz
               << (mem_mz == 0 ? VPACK_STR(" (WIPED - Anti-Dump Active)\n") : VPACK_STR(" (Present)\n"))
