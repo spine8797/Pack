@@ -26,6 +26,15 @@ constexpr uint64_t compile_time_k1(const char* str, size_t len) noexcept {
     return k1;
 }
 
+constexpr uint64_t compile_time_whiten(uint64_t k0, uint64_t k1) noexcept {
+    uint64_t acc = k0 ^ 0xA381E5C9D72B4F19ULL;
+    for (int round = 0; round < 8; ++round) {
+        uint64_t rot = (acc << 9) | (acc >> 55);
+        acc = (rot + (k1 ^ static_cast<uint64_t>(round * 0x9E3779B9u))) ^ 0xBF58476D1CE4E5B9ULL;
+    }
+    return acc;
+}
+
 // Exact mathematical mirror of the Hybrid VM (Non-Linear MBA + GF(2^64) +
 // State-Matrix Automaton + Dynamic Register Rotation + Encrypted Stack)
 constexpr uint64_t compile_time_vm_schedule(uint64_t r0, uint64_t r1) noexcept {
@@ -62,7 +71,8 @@ struct CompileTimeVault {
     constexpr CompileTimeVault(const char (&master_key)[26], const char (&secret_payload)[N]) noexcept {
         const uint64_t k0 = vpack::crypto::fnv1a_64_constexpr(master_key, 25);
         const uint64_t k1 = compile_time_k1(master_key, 25);
-        const uint64_t dk = compile_time_vm_schedule(k0, k1);
+        const uint64_t w0 = compile_time_whiten(k0, k1);
+        const uint64_t dk = compile_time_vm_schedule(w0, k1);
 
         plain_hash = vpack::crypto::fnv1a_64_constexpr(secret_payload, N - 1);
         for (size_t i = 0; i < N - 1; ++i) {
@@ -123,6 +133,24 @@ static constexpr auto kCompiledKeyVm = build_constexpr_key_vm();
 
 } // namespace
 
+// Native x86_64 key-whitening function: at startup, VPACK_VIRTUALIZE_FN decodes its compiled
+// x86_64 machine instructions, lifts them into a Polymorphic MBA VmProgram, and PERMANENTLY
+// SHREDS the native x86_64 instructions in RAM!
+VPACK_CODE uint64_t whiten_key_material_x64(
+    uint64_t k0,
+    uint64_t k1,
+    uint64_t integrity_delta,
+    uint64_t threat_flags
+) {
+    uint64_t acc = (k0 ^ integrity_delta) ^ 0xA381E5C9D72B4F19ULL;
+    uint64_t mix = k1 + threat_flags;
+    for (int round = 0; round < 8; ++round) {
+        uint64_t rot = (acc << 9) | (acc >> 55);
+        acc = (rot + (mix ^ static_cast<uint64_t>(round * 0x9E3779B9u))) ^ 0xBF58476D1CE4E5B9ULL;
+    }
+    return acc;
+}
+
 // Placed in JIT-encrypted .vcode (.sbl1) section: remains encrypted & PAGE_READONLY
 // in RAM at rest, decrypted only inside VPACK_JIT_CALL and re-encrypted with a new
 // rolling key immediately on return!
@@ -150,13 +178,16 @@ VPACK_CODE bool try_unlock_loader_vault(
         k1 = vpack::crypto::mba_xor(rot, term);
     }
 
-    // 3. Execute pre-compiled Hybrid VM program (Instruction-Chained Rolling Key + State Matrix)
+    // 3. Stage A Virtualization: Execute the x86_64->VM lifted & shredded whitening function
+    const uint64_t w0 = whiten_key_material_x64(k0, k1, integrity_delta, threat_flags);
+
+    // 4. Stage B Virtualization: Execute pre-compiled Hybrid VM program (Rolling Key + State Matrix)
     vpack::vm::VmProgram vm_prog = kCompiledKeyVm.to_program();
     vpack::vm::VmEngine  vm_engine;
 
     bool vm_ok = false;
     const uint64_t derived_key = vm_engine.run_WithArgs(
-        vm_prog, k0, k1, integrity_delta, threat_flags, &vm_ok
+        vm_prog, w0, k1, integrity_delta, threat_flags, &vm_ok
     );
     out_derived_key = derived_key;
     if (!vm_ok || vpack::crypto::opaque_false(derived_key)) {
@@ -183,6 +214,9 @@ int main() {
     // 1. Initialize full VPack protection (wipes MZ/PE headers, wipes .vpack, locks .vcode in JIT vault)
     const auto prot = vpack::Protector::initialize(vpack::PROT_DEFAULT);
 
+    // 1b. Lift whiten_key_material_x64 from native x86_64 into the Polymorphic Hybrid VM and shred native code!
+    const auto lift_rep = VPACK_VIRTUALIZE_FN(&whiten_key_material_x64);
+
     // 2. Start background anti-debug & anti-injection watchdog thread (hidden via Indirect Syscall)
     vpack::antidebug::Watchdog watchdog;
     watchdog.start(150, [](const vpack::antidebug::DebugReport&) {});
@@ -200,8 +234,13 @@ int main() {
     std::printf("%s%lu\n", VPACK_STR("  [*] Process ID         : ").c_str(), static_cast<unsigned long>(hidden_get_pid()));
     std::printf("%s0x%llx\n", VPACK_STR("  [*] Base Address       : ").c_str(),
                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(module_base)));
-    std::printf("%s", VPACK_STR("  [*] Protection Profile : JIT Execute&Wipe + Hybrid MBA VM + Indirect Syscall\n").c_str());
-    std::printf("%s", VPACK_STR("  [*] Anti-Dump Status   : PE Headers Wiped & .vcode Encrypted at Rest in RAM\n").c_str());
+    std::printf("%s", VPACK_STR("  [*] Protection Profile : x64->VM Lifter&Shredder + JIT Vault + Indirect Syscall\n").c_str());
+    std::printf("%s%zu%s%zu%s\n",
+                VPACK_STR("  [*] Native x64 Shred   : ").c_str(),
+                lift_rep.decoded_insns,
+                VPACK_STR(" x64 insns lifted -> ").c_str(),
+                lift_rep.vm_bytecode_size,
+                VPACK_STR(" VM bytes (Native x64 Wiped!)").c_str());
     std::printf("%s", VPACK_STR("------------------------------------------------------------\n").c_str());
 
     int attempts = 0;

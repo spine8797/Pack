@@ -459,6 +459,39 @@ bool is_vcode_jit_active() noexcept {
     return g_vcode_jit_active.load(std::memory_order_acquire);
 }
 
+bool modify_vcode_in_vault(const std::function<bool(uint8_t* vcode_base, size_t vcode_size)>& mutator) noexcept {
+    if (!mutator || !g_vcode_jit_active.load(std::memory_order_acquire)) {
+        return false;
+    }
+    acquire_jit_lock();
+    bool ok = false;
+    if (g_jit_recursion_depth == 0) {
+        auto* base = reinterpret_cast<uint8_t*>(g_vcode_encoded_base ^ kJitPtrMask);
+        if (crypto::fnv1a_64(base, g_vcode_size) == g_vcode_cipher_hash) {
+            DWORD old_prot = 0;
+            protect_memory_via_syscall(base, g_vcode_size, PAGE_READWRITE, &old_prot);
+            jit_mba_stream_transform(base, g_vcode_size, g_vcode_rolling_key);
+
+            if (crypto::fnv1a_64(base, g_vcode_size) == g_vcode_plain_hash) {
+                ok = mutator(base, g_vcode_size);
+                g_vcode_plain_hash = crypto::fnv1a_64(base, g_vcode_size);
+            }
+
+            const uint64_t next_gen = g_vcode_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+            g_vcode_rolling_key = crypto::poly_permute_64(
+                g_vcode_rolling_key ^ __rdtsc() ^ read_kuser_interrupt_time(),
+                next_gen ^ 0x9E3779B97F4A7C15ULL
+            );
+            jit_mba_stream_transform(base, g_vcode_size, g_vcode_rolling_key);
+            g_vcode_cipher_hash = crypto::fnv1a_64(base, g_vcode_size);
+            protect_memory_via_syscall(base, g_vcode_size, PAGE_READONLY, &old_prot);
+            FlushInstructionCache(GetCurrentProcess(), base, g_vcode_size);
+        }
+    }
+    release_jit_lock();
+    return ok;
+}
+
 bool wipe_and_lock_vinit_section(uint8_t* vinit_base, size_t vinit_size) noexcept {
     if (!vinit_base || vinit_size == 0) return false;
     DWORD old_prot = 0;

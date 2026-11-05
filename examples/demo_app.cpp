@@ -88,6 +88,10 @@ int main(int argc, char** argv) {
     // 1. Initialize Runtime Protection (Anti-Debug + Anti-Dump + PE Header Erase + JIT .vcode Vault)
     const auto status = vpack::Protector::initialize(vpack::PROT_DEFAULT);
 
+    // 1b. Lift native x86_64 machine code of compute_protected_signature into the Polymorphic Hybrid VM
+    //     and PERMANENTLY SHRED its native x86_64 instructions in RAM!
+    const auto lift_rep = VPACK_VIRTUALIZE_FN(&compute_protected_signature);
+
     const auto* module_base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
     const uint16_t mem_mz = *reinterpret_cast<const uint16_t*>(module_base);
 
@@ -103,6 +107,9 @@ int main(int argc, char** argv) {
               << VPACK_STR("    - Base Address           : 0x") << std::hex << reinterpret_cast<uintptr_t>(module_base) << "\n"
               << VPACK_STR("    - Packed Binary (.vpack) : ") << (status.packed_binary ? VPACK_STR("YES") : VPACK_STR("NO (Unpacked Dev Build)")) << "\n"
               << VPACK_STR("    - .vcode JIT Vault       : ") << (vpack::antidump::is_vcode_jit_active() ? VPACK_STR("ACTIVE (Encrypted & PAGE_READONLY at Rest)") : VPACK_STR("INACTIVE")) << "\n"
+              << VPACK_STR("    - x64->VM Lifter & Shred : ") << (lift_rep.native_shredded ? VPACK_STR("SHREDDED (") : VPACK_STR("INACTIVE ("))
+              << std::dec << lift_rep.decoded_insns << VPACK_STR(" x64 insns -> ")
+              << lift_rep.vm_bytecode_size << VPACK_STR(" VM bytes, native x64 wiped!)\n")
               << VPACK_STR("    - .text Baseline Hash    : 0x") << std::hex << status.text_baseline_hash << "\n"
               << VPACK_STR("    - In-Memory MZ Signature : 0x") << std::hex << mem_mz
               << (mem_mz == 0 ? VPACK_STR(" (WIPED - Anti-Dump Active)\n") : VPACK_STR(" (Present)\n"))

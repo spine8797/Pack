@@ -14,7 +14,9 @@ namespace vpack::vm {
 enum VmReg : uint8_t {
     R0 = 0, R1, R2, R3, R4, R5, R6, R7,
     R8, R9, R10, R11, R12, R13, R14, R15,
-    REG_COUNT = 16
+    VTMP0 = 16,
+    VTMP1 = 17,
+    REG_COUNT = 18
 };
 
 enum VmFlags : uint32_t {
@@ -67,6 +69,17 @@ enum LogicalOpcode : uint8_t {
     OP_ROTATE_REGS,
     OP_STATE_MATRIX,
     OP_ENTANGLE_ENV,
+    // Extended x86_64 Native Lifter Opcodes (Full Jcc + Variable Shift + Zero-Extend)
+    OP_JGE,
+    OP_JLE,
+    OP_JA,
+    OP_JB,
+    OP_JAE,
+    OP_JBE,
+    OP_SHL_REG,
+    OP_SHR_REG,
+    OP_SAR_IMM,
+    OP_MOVZX32,
     OP_RET,
     OP_MAX_COUNT
 };
@@ -174,6 +187,7 @@ struct VmContext {
     std::array<uint64_t, REG_COUNT> regs{};
     std::array<uint8_t, REG_COUNT>  reg_map{};
     std::vector<uint64_t>           stack;
+    alignas(16) std::array<uint8_t, 2048> scratch_frame{};
     size_t                          ip = 0;
     uint64_t                        rolling_state = 0;
     uint64_t                        stack_key = 0;
@@ -190,11 +204,13 @@ struct VmContext {
     }
 
     VPACK_FORCEINLINE uint64_t& vreg(uint8_t logical_reg) noexcept {
-        return regs[reg_map[logical_reg & 0x0Fu]];
+        const uint8_t idx = (logical_reg < REG_COUNT) ? logical_reg : 0;
+        return regs[reg_map[idx]];
     }
 
     VPACK_FORCEINLINE const uint64_t& vreg(uint8_t logical_reg) const noexcept {
-        return regs[reg_map[logical_reg & 0x0Fu]];
+        const uint8_t idx = (logical_reg < REG_COUNT) ? logical_reg : 0;
+        return regs[reg_map[idx]];
     }
 };
 
@@ -394,10 +410,14 @@ public:
     BytecodeBuilder& or_reg(VmReg dst, VmReg src);
     BytecodeBuilder& shl_imm(VmReg dst, uint8_t shift);
     BytecodeBuilder& shr_imm(VmReg dst, uint8_t shift);
+    BytecodeBuilder& sar_imm(VmReg dst, uint8_t shift);
+    BytecodeBuilder& shl_reg(VmReg dst, VmReg shift_reg);
+    BytecodeBuilder& shr_reg(VmReg dst, VmReg shift_reg);
     BytecodeBuilder& rol_imm(VmReg dst, uint8_t shift);
     BytecodeBuilder& ror_imm(VmReg dst, uint8_t shift);
     BytecodeBuilder& not_reg(VmReg dst);
     BytecodeBuilder& neg_reg(VmReg dst);
+    BytecodeBuilder& movzx32(VmReg dst, VmReg src);
     BytecodeBuilder& cmp_reg(VmReg lhs, VmReg rhs);
     BytecodeBuilder& cmp_imm(VmReg lhs, uint64_t imm);
 
@@ -407,6 +427,12 @@ public:
     BytecodeBuilder& jnz(const std::string& target_label);
     BytecodeBuilder& jg(const std::string& target_label);
     BytecodeBuilder& jl(const std::string& target_label);
+    BytecodeBuilder& jge(const std::string& target_label);
+    BytecodeBuilder& jle(const std::string& target_label);
+    BytecodeBuilder& ja(const std::string& target_label);
+    BytecodeBuilder& jb(const std::string& target_label);
+    BytecodeBuilder& jae(const std::string& target_label);
+    BytecodeBuilder& jbe(const std::string& target_label);
 
     BytecodeBuilder& push(VmReg src);
     BytecodeBuilder& pop(VmReg dst);
@@ -464,6 +490,15 @@ public:
         uint64_t r1 = 0,
         uint64_t r2 = 0,
         uint64_t r3 = 0,
+        bool* out_ok = nullptr
+    ) const noexcept;
+
+    uint64_t run_x64_abi(
+        const VmProgram& program,
+        uint64_t rcx_arg = 0,
+        uint64_t rdx_arg = 0,
+        uint64_t r8_arg  = 0,
+        uint64_t r9_arg  = 0,
         bool* out_ok = nullptr
     ) const noexcept;
 

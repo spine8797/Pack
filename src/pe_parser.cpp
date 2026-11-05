@@ -996,7 +996,53 @@ PackResult PeImage::pack(const PackOptions& opts) {
         }
     };
 
-    // 3. Encrypt .text, .vcode, .vinit, .pdata, .xdata, and .rdata string pool
+    // 3. Use .pdata (RUNTIME_FUNCTION) exact function boundaries to replace all inter-function
+    //    0x90/0xCC alignment sleds in .text with entangled bogus x86_64 instruction bytes so
+    //    adjacent functions fuse together with zero 90 90 90 90 visual boundaries in memory viewers!
+    {
+        const auto& exc_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        uint32_t pdata_off = 0;
+        if (exc_dir.VirtualAddress != 0 &&
+            exc_dir.Size >= sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY) &&
+            rva_to_file_offset(exc_dir.VirtualAddress, pdata_off) &&
+            pdata_off + exc_dir.Size <= data_.size()) {
+            const size_t entry_count = exc_dir.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+            const auto*  entries     = reinterpret_cast<const IMAGE_RUNTIME_FUNCTION_ENTRY*>(data_.data() + pdata_off);
+            uint64_t     bogus_prng  = seed ^ 0xE791C3A58B2D4F19ULL;
+
+            for (size_t idx = 0; idx + 1 < entry_count; ++idx) {
+                const uint32_t gap_start = entries[idx].EndAddress;
+                const uint32_t gap_end   = entries[idx + 1].BeginAddress;
+                if (gap_end > gap_start && (gap_end - gap_start) <= 32) {
+                    uint32_t gap_file_off = 0;
+                    if (rva_to_file_offset(gap_start, gap_file_off) &&
+                        gap_file_off + (gap_end - gap_start) <= data_.size()) {
+                        uint8_t* gap_ptr = data_.data() + gap_file_off;
+                        const uint32_t gap_len = gap_end - gap_start;
+                        bool all_pad = true;
+                        for (uint32_t b = 0; b < gap_len; ++b) {
+                            if (gap_ptr[b] != 0x90 && gap_ptr[b] != 0xCC) {
+                                all_pad = false;
+                                break;
+                            }
+                        }
+                        if (all_pad) {
+                            for (uint32_t b = 0; b < gap_len; ++b) {
+                                bogus_prng = rotr64(bogus_prng, 11) + 0x9E3779B97F4A7C15ULL;
+                                uint8_t rbyte = static_cast<uint8_t>((bogus_prng ^ (bogus_prng >> 29)) & 0xFFu);
+                                if (rbyte == 0x90 || rbyte == 0x00 || rbyte == 0xCC) {
+                                    rbyte ^= 0x48u;
+                                }
+                                gap_ptr[b] = rbyte;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Encrypt .text, .vcode, .vinit, .pdata, .xdata, and .rdata string pool
     if (opts.encrypt_text_section) {
         encrypt_section_by_name(".text", 0x91E3C5A78D2B4F19ULL);
     }

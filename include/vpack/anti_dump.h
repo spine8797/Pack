@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <utility>
+#include <functional>
 
 namespace vpack::antidump {
 
@@ -69,6 +70,8 @@ bool verify_vcode_integrity() noexcept;
 bool rotate_vcode_idle_key() noexcept;
 uint64_t vcode_jit_generation() noexcept;
 bool is_vcode_jit_active() noexcept;
+
+bool modify_vcode_in_vault(const std::function<bool(uint8_t* vcode_base, size_t vcode_size)>& mutator) noexcept;
 
 bool wipe_and_lock_vinit_section(uint8_t* vinit_base, size_t vinit_size) noexcept;
 

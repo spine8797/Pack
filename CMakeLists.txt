@@ -38,6 +38,7 @@ add_library(vpack STATIC
     src/anti_dump.cpp
     src/page_vault.cpp
     src/vm.cpp
+    src/virtualizer.cpp
     src/pe_parser.cpp
     src/vpack_sdk.cpp
 )

@@ -6,6 +6,7 @@
 #include "vpack/anti_dump.h"
 #include "vpack/page_vault.h"
 #include "vpack/vm.h"
+#include "vpack/virtualizer.h"
 #include "vpack/pe_parser.h"
 
 namespace vpack {

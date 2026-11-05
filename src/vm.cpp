@@ -456,14 +456,14 @@ VPACK_CODE bool h_rotate_regs(VmExecState& s) noexcept {
     if (!s.read_u8(step)) return false;
     const uint8_t rot = (step & 0x0Fu) | 1u;
 
-    std::array<uint64_t, REG_COUNT> logical_snapshot{};
-    for (uint8_t i = 0; i < REG_COUNT; ++i) {
+    std::array<uint64_t, 16> logical_snapshot{};
+    for (uint8_t i = 0; i < 16; ++i) {
         logical_snapshot[i] = s.ctx.vreg(i);
     }
-    for (uint8_t i = 0; i < REG_COUNT; ++i) {
+    for (uint8_t i = 0; i < 16; ++i) {
         s.ctx.reg_map[i] = static_cast<uint8_t>((s.ctx.reg_map[i] + rot) & 0x0Fu);
     }
-    for (uint8_t i = 0; i < REG_COUNT; ++i) {
+    for (uint8_t i = 0; i < 16; ++i) {
         s.ctx.regs[s.ctx.reg_map[i]] = logical_snapshot[i];
     }
     crypto::secure_wipe(logical_snapshot.data(), sizeof(logical_snapshot), s.ctx.rolling_state);
@@ -494,6 +494,104 @@ VPACK_CODE bool h_entangle_env(VmExecState& s) noexcept {
     if (!s.read_u8(dst) || dst >= REG_COUNT) return false;
     const uint64_t poison = antidebug::compute_environmental_key_poison() ^ s.ctx.env_poison;
     s.ctx.vreg(dst)       = crypto::mba_xor(s.ctx.vreg(dst), poison);
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_jge(VmExecState& s) noexcept {
+    uint32_t target = 0;
+    if (!s.read_u32(target) || target >= s.code_size) return false;
+    bool sf = (s.ctx.flags & FLAG_SF) != 0;
+    bool of = (s.ctx.flags & FLAG_OF) != 0;
+    if (sf == of) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_jle(VmExecState& s) noexcept {
+    uint32_t target = 0;
+    if (!s.read_u32(target) || target >= s.code_size) return false;
+    bool zf = (s.ctx.flags & FLAG_ZF) != 0;
+    bool sf = (s.ctx.flags & FLAG_SF) != 0;
+    bool of = (s.ctx.flags & FLAG_OF) != 0;
+    if (zf || (sf != of)) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_ja(VmExecState& s) noexcept {
+    uint32_t target = 0;
+    if (!s.read_u32(target) || target >= s.code_size) return false;
+    bool cf = (s.ctx.flags & FLAG_CF) != 0;
+    bool zf = (s.ctx.flags & FLAG_ZF) != 0;
+    if (!cf && !zf) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_jb(VmExecState& s) noexcept {
+    uint32_t target = 0;
+    if (!s.read_u32(target) || target >= s.code_size) return false;
+    if (s.ctx.flags & FLAG_CF) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_jae(VmExecState& s) noexcept {
+    uint32_t target = 0;
+    if (!s.read_u32(target) || target >= s.code_size) return false;
+    if (!(s.ctx.flags & FLAG_CF)) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_jbe(VmExecState& s) noexcept {
+    uint32_t target = 0;
+    if (!s.read_u32(target) || target >= s.code_size) return false;
+    if (s.ctx.flags & (FLAG_CF | FLAG_ZF)) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_shl_reg(VmExecState& s) noexcept {
+    uint8_t dst = 0, src = 0;
+    if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
+    s.ctx.vreg(dst) <<= (s.ctx.vreg(src) & 63ULL);
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_shr_reg(VmExecState& s) noexcept {
+    uint8_t dst = 0, src = 0;
+    if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
+    s.ctx.vreg(dst) >>= (s.ctx.vreg(src) & 63ULL);
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_sar_imm(VmExecState& s) noexcept {
+    uint8_t dst = 0, shift = 0;
+    if (!s.read_u8(dst) || !s.read_u8(shift) || dst >= REG_COUNT) return false;
+    s.ctx.vreg(dst) = static_cast<uint64_t>(static_cast<int64_t>(s.ctx.vreg(dst)) >> (shift & 63u));
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_movzx32(VmExecState& s) noexcept {
+    uint8_t dst = 0, src = 0;
+    if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
+    s.ctx.vreg(dst) = static_cast<uint64_t>(static_cast<uint32_t>(s.ctx.vreg(src)));
     return dispatch_next(s);
 }
 
@@ -634,6 +732,27 @@ BytecodeBuilder& BytecodeBuilder::shr_imm(VmReg dst, uint8_t shift) {
     return *this;
 }
 
+BytecodeBuilder& BytecodeBuilder::sar_imm(VmReg dst, uint8_t shift) {
+    emit_op(OP_SAR_IMM);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(shift);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::shl_reg(VmReg dst, VmReg shift_reg) {
+    emit_op(OP_SHL_REG);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(static_cast<uint8_t>(shift_reg));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::shr_reg(VmReg dst, VmReg shift_reg) {
+    emit_op(OP_SHR_REG);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(static_cast<uint8_t>(shift_reg));
+    return *this;
+}
+
 BytecodeBuilder& BytecodeBuilder::rol_imm(VmReg dst, uint8_t shift) {
     emit_op(OP_ROL_IMM);
     emit_u8(static_cast<uint8_t>(dst));
@@ -657,6 +776,13 @@ BytecodeBuilder& BytecodeBuilder::not_reg(VmReg dst) {
 BytecodeBuilder& BytecodeBuilder::neg_reg(VmReg dst) {
     emit_op(OP_NEG_REG);
     emit_u8(static_cast<uint8_t>(dst));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::movzx32(VmReg dst, VmReg src) {
+    emit_op(OP_MOVZX32);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(static_cast<uint8_t>(src));
     return *this;
 }
 
@@ -704,6 +830,36 @@ BytecodeBuilder& BytecodeBuilder::jg(const std::string& target_label) {
 
 BytecodeBuilder& BytecodeBuilder::jl(const std::string& target_label) {
     emit_branch(OP_JL, target_label);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::jge(const std::string& target_label) {
+    emit_branch(OP_JGE, target_label);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::jle(const std::string& target_label) {
+    emit_branch(OP_JLE, target_label);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::ja(const std::string& target_label) {
+    emit_branch(OP_JA, target_label);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::jb(const std::string& target_label) {
+    emit_branch(OP_JB, target_label);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::jae(const std::string& target_label) {
+    emit_branch(OP_JAE, target_label);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::jbe(const std::string& target_label) {
+    emit_branch(OP_JBE, target_label);
     return *this;
 }
 
@@ -912,7 +1068,17 @@ VPACK_CODE bool execute_protected_vm(
         encode_handler_slot(&h_rotate_regs,      runtime_ptr_mask, 36),
         encode_handler_slot(&h_state_matrix,     runtime_ptr_mask, 37),
         encode_handler_slot(&h_entangle_env,     runtime_ptr_mask, 38),
-        encode_handler_slot(&h_ret,              runtime_ptr_mask, 39)
+        encode_handler_slot(&h_jge,              runtime_ptr_mask, 39),
+        encode_handler_slot(&h_jle,              runtime_ptr_mask, 40),
+        encode_handler_slot(&h_ja,               runtime_ptr_mask, 41),
+        encode_handler_slot(&h_jb,               runtime_ptr_mask, 42),
+        encode_handler_slot(&h_jae,              runtime_ptr_mask, 43),
+        encode_handler_slot(&h_jbe,              runtime_ptr_mask, 44),
+        encode_handler_slot(&h_shl_reg,          runtime_ptr_mask, 45),
+        encode_handler_slot(&h_shr_reg,          runtime_ptr_mask, 46),
+        encode_handler_slot(&h_sar_imm,          runtime_ptr_mask, 47),
+        encode_handler_slot(&h_movzx32,          runtime_ptr_mask, 48),
+        encode_handler_slot(&h_ret,              runtime_ptr_mask, 49)
     };
 
     for (uint8_t i = 0; i < REG_COUNT; ++i) {
@@ -975,6 +1141,30 @@ uint64_t VmEngine::run_WithArgs(
     bool ok = execute(program, ctx, &ret);
     if (out_ok) *out_ok = ok;
     crypto::secure_wipe(ctx.regs.data(), sizeof(ctx.regs), ret);
+    return ret;
+}
+
+uint64_t VmEngine::run_x64_abi(
+    const VmProgram& program,
+    uint64_t rcx_arg,
+    uint64_t rdx_arg,
+    uint64_t r8_arg,
+    uint64_t r9_arg,
+    bool* out_ok
+) const noexcept {
+    VmContext ctx;
+    // Map Windows x64 ABI argument registers (RCX=1, RDX=2, R8=8, R9=9) and stack pointer (RSP=4)
+    ctx.regs[R1] = rcx_arg;
+    ctx.regs[R2] = rdx_arg;
+    ctx.regs[R8] = r8_arg;
+    ctx.regs[R9] = r9_arg;
+    ctx.regs[R4] = (reinterpret_cast<uint64_t>(ctx.scratch_frame.data() + 1024) & ~0xFULL) - 8ULL;
+
+    uint64_t ret = 0;
+    bool ok = execute(program, ctx, &ret);
+    if (out_ok) *out_ok = ok;
+    crypto::secure_wipe(ctx.regs.data(), sizeof(ctx.regs), ret);
+    crypto::secure_wipe(ctx.scratch_frame.data(), ctx.scratch_frame.size(), ret ^ 0x9E3779B97F4A7C15ULL);
     return ret;
 }
 
