@@ -3,6 +3,7 @@
 #include "vpack/config.h"
 #include "vpack/crypto.h"
 #include "vpack/anti_debug.h"
+#include "vpack/anti_vm.h"
 #include "vpack/anti_dump.h"
 #include "vpack/page_vault.h"
 #include "vpack/vm.h"
@@ -14,9 +15,11 @@ namespace vpack {
 struct RuntimeStatus {
     bool                    initialized = false;
     bool                    packed_binary = false;
+    bool                    page_vault_active = false;
     uint32_t                active_flags = PROT_NONE;
     uint64_t                text_baseline_hash = 0;
     antidebug::DebugReport  initial_debug_report{};
+    antivm::VmReport        initial_vm_report{};
 };
 
 class Protector {

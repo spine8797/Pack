@@ -76,15 +76,10 @@ uint64_t hash_unicode_ci(const wchar_t* buf, size_t char_len) noexcept {
 ModuleLayoutInfo g_cached_main_layout{};
 bool             g_has_cached_layout = false;
 
-constexpr size_t kMaxBaselineModules = 128;
-void*            g_baseline_modules[kMaxBaselineModules]{};
-size_t           g_baseline_module_count = 0;
-
 // ============================================================================
-// JIT .vcode Vault State (Obfuscated in RAM)
+// JIT .vcode Vault State (Dynamically Masked in RAM — Zero Static Ptr Key)
 // ============================================================================
-constexpr uintptr_t kJitPtrMask = static_cast<uintptr_t>(0xA59E3779B97F4A7CULL);
-
+uintptr_t             g_jit_ptr_mask       = 0;
 uintptr_t             g_vcode_encoded_base = 0;
 size_t                g_vcode_size         = 0;
 uint64_t              g_vcode_plain_hash   = 0;
@@ -204,59 +199,181 @@ const void* find_syscall_ret_gadget(const uint8_t* p) noexcept {
     return nullptr;
 }
 
+struct ZwSyscallTableEntry {
+    uint32_t       rva        = 0;
+    uint64_t       nt_hash_ci = 0;
+    uint64_t       zw_hash_ci = 0;
+    const uint8_t* stub_ptr   = nullptr;
+};
+
+constexpr size_t    kMaxZwSyscalls  = 640;
+ZwSyscallTableEntry g_zw_table[kMaxZwSyscalls]{};
+size_t              g_zw_count      = 0;
+bool                g_zw_table_init = false;
+
+uint64_t hash_zw_as_nt_ci(const char* zw_name) noexcept {
+    uint64_t hash = 0xCBF29CE484222325ULL;
+    const char prefix[2] = {'n', 't'};
+    for (char c : prefix) {
+        hash ^= static_cast<uint8_t>(c);
+        hash *= 0x100000001B3ULL;
+    }
+    const char* p = zw_name + 2;
+    while (*p) {
+        char c = *p++;
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c + ('a' - 'A'));
+        }
+        hash ^= static_cast<uint8_t>(c);
+        hash *= 0x100000001B3ULL;
+    }
+    return hash;
+}
+
+void ensure_sorted_zw_table() noexcept {
+    if (g_zw_table_init) return;
+
+    uint8_t* peb = get_peb_mutable();
+    if (!peb) return;
+#if defined(_M_X64) || defined(__x86_64__)
+    auto* ldr = *reinterpret_cast<PebLdrDataT**>(peb + 0x18);
+#else
+    auto* ldr = *reinterpret_cast<PebLdrDataT**>(peb + 0x0C);
+#endif
+    if (!ldr) return;
+
+    LIST_ENTRY* head = &ldr->InLoadOrderModuleList;
+    for (LIST_ENTRY* it = head->Flink; it && it != head; it = it->Flink) {
+        auto* entry = reinterpret_cast<LdrDataTableEntryLoadOrderT*>(it);
+        if (!entry->DllBase || !entry->BaseDllName.Buffer || entry->BaseDllName.Length == 0) {
+            continue;
+        }
+        size_t char_count = entry->BaseDllName.Length / sizeof(wchar_t);
+        if (hash_unicode_ci(entry->BaseDllName.Buffer, char_count) != VPACK_HASH_CI("ntdll.dll")) {
+            continue;
+        }
+
+        const auto* mod_base = static_cast<const uint8_t*>(entry->DllBase);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod_base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) break;
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(mod_base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) break;
+
+        const auto& exp_dir_entry = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (exp_dir_entry.VirtualAddress == 0 || exp_dir_entry.Size == 0) break;
+
+        const auto* exp_dir = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(mod_base + exp_dir_entry.VirtualAddress);
+        const auto* names   = reinterpret_cast<const DWORD*>(mod_base + exp_dir->AddressOfNames);
+        const auto* funcs   = reinterpret_cast<const DWORD*>(mod_base + exp_dir->AddressOfFunctions);
+        const auto* ords    = reinterpret_cast<const WORD*>(mod_base + exp_dir->AddressOfNameOrdinals);
+
+        g_zw_count = 0;
+        for (DWORD i = 0; i < exp_dir->NumberOfNames && g_zw_count < kMaxZwSyscalls; ++i) {
+            const char* fn_name = reinterpret_cast<const char*>(mod_base + names[i]);
+            if (fn_name[0] != 'Z' || fn_name[1] != 'w') continue;
+
+            const DWORD func_rva = funcs[ords[i]];
+            if (func_rva >= exp_dir_entry.VirtualAddress &&
+                func_rva < exp_dir_entry.VirtualAddress + exp_dir_entry.Size) {
+                continue; // Skip forwarded exports
+            }
+
+            ZwSyscallTableEntry item{};
+            item.rva        = func_rva;
+            item.nt_hash_ci = hash_zw_as_nt_ci(fn_name);
+            item.zw_hash_ci = crypto::fnv1a_64_ci(fn_name);
+            item.stub_ptr   = mod_base + func_rva;
+            g_zw_table[g_zw_count++] = item;
+        }
+
+        // Insertion sort by ascending RVA: index in sorted Zw* table == Kernel SSN!
+        for (size_t i = 1; i < g_zw_count; ++i) {
+            ZwSyscallTableEntry key = g_zw_table[i];
+            size_t j = i;
+            while (j > 0 && g_zw_table[j - 1].rva > key.rva) {
+                g_zw_table[j] = g_zw_table[j - 1];
+                --j;
+            }
+            g_zw_table[j] = key;
+        }
+
+        g_zw_table_init = (g_zw_count > 0);
+        break;
+    }
+}
+
 } // namespace
 
 bool resolve_ntdll_syscall(uint64_t proc_hash_ci, SyscallEntry& out_entry) noexcept {
     out_entry = SyscallEntry{};
-    void* raw_fn = resolve_export_by_hash(VPACK_HASH_CI("ntdll.dll"), proc_hash_ci);
-    if (!raw_fn) return false;
+    ensure_sorted_zw_table();
 
-    const auto* fn_bytes = static_cast<const uint8_t*>(raw_fn);
+    for (size_t idx = 0; idx < g_zw_count; ++idx) {
+        if (g_zw_table[idx].nt_hash_ci != proc_hash_ci &&
+            g_zw_table[idx].zw_hash_ci != proc_hash_ci) {
+            continue;
+        }
 
-    // 1. Direct inspection if unhooked
-    if (is_clean_syscall_prologue(fn_bytes)) {
-        out_entry.ssn         = *reinterpret_cast<const uint32_t*>(fn_bytes + 4);
-        out_entry.gadget_addr = find_syscall_ret_gadget(fn_bytes);
-        out_entry.is_hooked   = false;
-    } else {
-        // 2. HalosGate / Tartarus' Gate: function is hooked (e.g. ScyllaHide JMP at +0x00 or +0x03).
-        // Scan neighboring ntdll syscall stubs (+/- 32-byte stride) to recover exact SSN & clean gadget!
-        out_entry.is_hooked = true;
-        constexpr intptr_t kStubStride = 32;
-        for (int idx = 1; idx <= 64; ++idx) {
-            // Check downward neighbor (+idx * 32)
-            const uint8_t* down = fn_bytes + idx * kStubStride;
-            if (is_clean_syscall_prologue(down)) {
-                uint32_t neighbor_ssn = *reinterpret_cast<const uint32_t*>(down + 4);
-                if (neighbor_ssn >= static_cast<uint32_t>(idx)) {
-                    out_entry.ssn         = neighbor_ssn - static_cast<uint32_t>(idx);
-                    out_entry.gadget_addr = find_syscall_ret_gadget(down);
+        const uint8_t* fn_bytes = g_zw_table[idx].stub_ptr;
+        if (is_clean_syscall_prologue(fn_bytes)) {
+            out_entry.ssn         = *reinterpret_cast<const uint32_t*>(fn_bytes + 4);
+            out_entry.gadget_addr = find_syscall_ret_gadget(fn_bytes);
+            out_entry.is_hooked   = false;
+        } else {
+            // Function is inline-hooked (e.g. ScyllaHide JMP at +0x00 or +0x03).
+            // Recover exact SSN from the sorted Zw* address table & nearest clean neighbor!
+            out_entry.is_hooked = true;
+            out_entry.ssn       = static_cast<uint32_t>(idx);
+
+            for (size_t dist = 1; dist < g_zw_count; ++dist) {
+                if (idx + dist < g_zw_count) {
+                    const uint8_t* down = g_zw_table[idx + dist].stub_ptr;
+                    if (is_clean_syscall_prologue(down)) {
+                        const uint32_t neighbor_ssn = *reinterpret_cast<const uint32_t*>(down + 4);
+                        if (neighbor_ssn >= static_cast<uint32_t>(dist)) {
+                            out_entry.ssn = neighbor_ssn - static_cast<uint32_t>(dist);
+                        }
+                        out_entry.gadget_addr = find_syscall_ret_gadget(down);
+                        if (out_entry.gadget_addr) break;
+                    }
+                }
+                if (idx >= dist) {
+                    const uint8_t* up = g_zw_table[idx - dist].stub_ptr;
+                    if (is_clean_syscall_prologue(up)) {
+                        const uint32_t neighbor_ssn = *reinterpret_cast<const uint32_t*>(up + 4);
+                        out_entry.ssn         = neighbor_ssn + static_cast<uint32_t>(dist);
+                        out_entry.gadget_addr = find_syscall_ret_gadget(up);
+                        if (out_entry.gadget_addr) break;
+                    }
+                }
+            }
+        }
+
+        if (!out_entry.gadget_addr) {
+            for (size_t k = 0; k < g_zw_count; ++k) {
+                if (const void* g = find_syscall_ret_gadget(g_zw_table[k].stub_ptr)) {
+                    out_entry.gadget_addr = g;
                     break;
                 }
             }
-            // Check upward neighbor (-idx * 32)
-            const uint8_t* up = fn_bytes - idx * kStubStride;
-            if (is_clean_syscall_prologue(up)) {
-                uint32_t neighbor_ssn = *reinterpret_cast<const uint32_t*>(up + 4);
-                out_entry.ssn         = neighbor_ssn + static_cast<uint32_t>(idx);
-                out_entry.gadget_addr = find_syscall_ret_gadget(up);
-                break;
-            }
         }
+        return out_entry.ssn != 0xFFFFFFFFu && out_entry.gadget_addr != nullptr;
     }
 
-    // If gadget wasn't in the immediate stub, scan nearby ntdll stubs for any `0F 05 C3`
-    if (!out_entry.gadget_addr) {
-        for (int idx = 1; idx <= 64; ++idx) {
-            if (const void* g = find_syscall_ret_gadget(fn_bytes + idx * 32)) {
-                out_entry.gadget_addr = g;
-                break;
-            }
-        }
-    }
-
-    return out_entry.ssn != 0xFFFFFFFFu && out_entry.gadget_addr != nullptr;
+    return false;
 }
+
+#if defined(_MSC_VER) && defined(_M_X64)
+#pragma section(".vpvlt", execute, read)
+#pragma code_seg(".vpvlt")
+__declspec(allocate(".vpvlt")) alignas(16) const uint8_t kMsvcSyscallTrampoline[16] = {
+    0x4C, 0x8B, 0xD1,             // mov r10, rcx
+    0x8B, 0x44, 0x24, 0x60,       // mov eax, dword ptr [rsp + 0x60] (12th param: ssn)
+    0xFF, 0x64, 0x24, 0x68,       // jmp qword ptr [rsp + 0x68]      (13th param: gadget_addr in ntdll)
+    0xC3, 0x90, 0x90, 0x90, 0x90
+};
+#pragma code_seg()
+#endif
 
 VPACK_NOINLINE long invoke_indirect_syscall(
     const SyscallEntry& entry,
@@ -265,34 +382,65 @@ VPACK_NOINLINE long invoke_indirect_syscall(
     uint64_t arg3,
     uint64_t arg4,
     uint64_t arg5,
-    uint64_t arg6
+    uint64_t arg6,
+    uint64_t arg7,
+    uint64_t arg8,
+    uint64_t arg9,
+    uint64_t arg10,
+    uint64_t arg11
 ) noexcept {
     if (!entry.gadget_addr || entry.ssn == 0xFFFFFFFFu) {
         return -1;
     }
 #if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(_M_X64))
     long status = -1;
-    const void* gadget = entry.gadget_addr;
+    volatile uint64_t stack_args[7] = { arg5, arg6, arg7, arg8, arg9, arg10, arg11 };
+
     register uint64_t r10_reg __asm__("r10") = arg1;
     register uint64_t rcx_reg __asm__("rcx") = arg1;
     register uint64_t rdx_reg __asm__("rdx") = arg2;
     register uint64_t r8_reg  __asm__("r8")  = arg3;
     register uint64_t r9_reg  __asm__("r9")  = arg4;
     register uint32_t eax_reg __asm__("eax") = entry.ssn;
+    register const volatile uint64_t* rsi_sa __asm__("rsi") = &stack_args[0];
+    register const void* rdi_gad __asm__("rdi") = entry.gadget_addr;
 
     __asm__ volatile(
-        "subq $0x38, %%rsp\n\t"
-        "movq %[a5], 0x20(%%rsp)\n\t"
-        "movq %[a6], 0x28(%%rsp)\n\t"
-        "callq *%[gad]\n\t"
-        "addq $0x38, %%rsp\n\t"
+        "subq $0x68, %%rsp\n\t"
+        "movq 0x00(%%rsi), %%r11\n\t"
+        "movq %%r11, 0x20(%%rsp)\n\t"
+        "movq 0x08(%%rsi), %%r11\n\t"
+        "movq %%r11, 0x28(%%rsp)\n\t"
+        "movq 0x10(%%rsi), %%r11\n\t"
+        "movq %%r11, 0x30(%%rsp)\n\t"
+        "movq 0x18(%%rsi), %%r11\n\t"
+        "movq %%r11, 0x38(%%rsp)\n\t"
+        "movq 0x20(%%rsi), %%r11\n\t"
+        "movq %%r11, 0x40(%%rsp)\n\t"
+        "movq 0x28(%%rsi), %%r11\n\t"
+        "movq %%r11, 0x48(%%rsp)\n\t"
+        "movq 0x30(%%rsi), %%r11\n\t"
+        "movq %%r11, 0x50(%%rsp)\n\t"
+        "callq *%%rdi\n\t"
+        "addq $0x68, %%rsp\n\t"
         : "=a"(status), "+r"(rcx_reg), "+r"(rdx_reg), "+r"(r8_reg), "+r"(r9_reg), "+r"(r10_reg)
-        : "0"(eax_reg), [gad] "r"(gadget), [a5] "r"(arg5), [a6] "r"(arg6)
+        : "0"(eax_reg), "r"(rdi_gad), "r"(rsi_sa)
         : "memory", "cc", "r11"
     );
     return status;
+#elif defined(_MSC_VER) && defined(_M_X64)
+    using FnMsvcSyscall = long(*)(
+        uint64_t, uint64_t, uint64_t, uint64_t,
+        uint64_t, uint64_t, uint64_t, uint64_t,
+        uint64_t, uint64_t, uint64_t, uint32_t, const void*
+    );
+    const auto fn = reinterpret_cast<FnMsvcSyscall>(
+        reinterpret_cast<const void*>(&kMsvcSyscallTrampoline[0])
+    );
+    return fn(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11, entry.ssn, entry.gadget_addr);
 #else
     (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    (void)arg7; (void)arg8; (void)arg9; (void)arg10; (void)arg11;
     return -1;
 #endif
 }
@@ -305,6 +453,8 @@ bool detect_ntdll_inline_hooks() noexcept {
         VPACK_HASH_CI("NtCreateThreadEx"),
         VPACK_HASH_CI("NtProtectVirtualMemory"),
         VPACK_HASH_CI("NtQueryVirtualMemory"),
+        VPACK_HASH_CI("NtGetContextThread"),
+        VPACK_HASH_CI("NtSetContextThread"),
         VPACK_HASH_CI("NtClose")
     };
     for (uint64_t h : kCriticalSyscalls) {
@@ -337,6 +487,14 @@ VPACK_INIT_CODE bool init_jit_vcode_vault(
         return false;
     }
 
+    // Derive runtime-randomized pointer mask (zero static XOR mask in RAM!)
+    g_jit_ptr_mask = static_cast<uintptr_t>(
+        crypto::poly_permute_64(
+            __rdtsc() ^ read_kuser_interrupt_time() ^ reinterpret_cast<uint64_t>(vcode_base),
+            boot_key ^ 0xA59E3779B97F4A7CULL
+        ) | 1ULL
+    );
+
     // Derive initial ephemeral rolling key from RDTSC + KUSER_SHARED_DATA + boot_key
     g_vcode_rolling_key = crypto::poly_permute_64(
         __rdtsc() ^ read_kuser_interrupt_time() ^ boot_key,
@@ -344,8 +502,8 @@ VPACK_INIT_CODE bool init_jit_vcode_vault(
     );
 
     // Single-pass register-only trans-encryption:
-    // Transitions .vcode directly from Stage 2's boot stream into the runtime JIT MBA stream
-    // while computing g_vcode_plain_hash in CPU registers so plaintext .vcode NEVER sits in RAM!
+    // Transitions .vcode directly from Stage 2's non-linear 64-bit boot stream into the runtime
+    // JIT MBA stream while computing g_vcode_plain_hash in CPU registers so plaintext .vcode NEVER sits in RAM!
     uint64_t fnv_hash  = 0xCBF29CE484222325ULL;
     uint64_t stub_r10  = boot_key;
     uint64_t jit_state = crypto::mba_xor(g_vcode_rolling_key, 0xC983E5A19F27B4D3ULL);
@@ -356,7 +514,10 @@ VPACK_INIT_CODE bool init_jit_vcode_vault(
         uint64_t stub_ks_word = 0;
         if (already_encrypted_by_stub) {
             for (int b = 0; b < 8; ++b) {
-                stub_r10 = rotr64(stub_r10, 13) + 0x9E3779B97F4A7C15ULL;
+                // Mirror of Stage 2 live re-encrypt: ror64(x,17) * M1; ^= (x>>31); += M2
+                stub_r10 = rotr64(stub_r10, 17) * 0xBF58476D1CE4E5B9ULL;
+                stub_r10 ^= (stub_r10 >> 31);
+                stub_r10 += 0x94D049BB133111EBULL;
                 stub_ks_word |= static_cast<uint64_t>(stub_r10 & 0xFFULL) << (b * 8);
             }
         }
@@ -374,7 +535,9 @@ VPACK_INIT_CODE bool init_jit_vcode_vault(
     for (size_t i = words * 8; i < vcode_size; ++i) {
         uint8_t stub_ks_byte = 0;
         if (already_encrypted_by_stub) {
-            stub_r10 = rotr64(stub_r10, 13) + 0x9E3779B97F4A7C15ULL;
+            stub_r10 = rotr64(stub_r10, 17) * 0xBF58476D1CE4E5B9ULL;
+            stub_r10 ^= (stub_r10 >> 31);
+            stub_r10 += 0x94D049BB133111EBULL;
             stub_ks_byte = static_cast<uint8_t>(stub_r10 & 0xFFULL);
         }
         const uint8_t plain_byte = static_cast<uint8_t>(vcode_base[i] ^ stub_ks_byte);
@@ -387,7 +550,7 @@ VPACK_INIT_CODE bool init_jit_vcode_vault(
     }
 
     g_vcode_plain_hash   = fnv_hash;
-    g_vcode_encoded_base = reinterpret_cast<uintptr_t>(vcode_base) ^ kJitPtrMask;
+    g_vcode_encoded_base = reinterpret_cast<uintptr_t>(vcode_base) ^ g_jit_ptr_mask;
     g_vcode_size         = vcode_size;
     g_vcode_generation.store(1, std::memory_order_relaxed);
     g_vcode_cipher_hash  = crypto::fnv1a_64(vcode_base, vcode_size);
@@ -408,7 +571,7 @@ bool verify_vcode_integrity() noexcept {
         return false;
     }
     acquire_jit_lock();
-    auto* base = reinterpret_cast<const uint8_t*>(g_vcode_encoded_base ^ kJitPtrMask);
+    auto* base = reinterpret_cast<const uint8_t*>(g_vcode_encoded_base ^ g_jit_ptr_mask);
     uint64_t expected = (g_jit_recursion_depth == 0) ? g_vcode_cipher_hash : g_vcode_plain_hash;
     uint64_t actual   = crypto::fnv1a_64(base, g_vcode_size);
     bool ok = (actual == expected);
@@ -425,7 +588,7 @@ bool rotate_vcode_idle_key() noexcept {
     }
     acquire_jit_lock();
     if (g_jit_recursion_depth == 0) {
-        auto* base = reinterpret_cast<uint8_t*>(g_vcode_encoded_base ^ kJitPtrMask);
+        auto* base = reinterpret_cast<uint8_t*>(g_vcode_encoded_base ^ g_jit_ptr_mask);
         if (crypto::fnv1a_64(base, g_vcode_size) != g_vcode_cipher_hash) {
             g_vcode_tampered.store(true, std::memory_order_release);
             release_jit_lock();
@@ -466,7 +629,7 @@ bool modify_vcode_in_vault(const std::function<bool(uint8_t* vcode_base, size_t 
     acquire_jit_lock();
     bool ok = false;
     if (g_jit_recursion_depth == 0) {
-        auto* base = reinterpret_cast<uint8_t*>(g_vcode_encoded_base ^ kJitPtrMask);
+        auto* base = reinterpret_cast<uint8_t*>(g_vcode_encoded_base ^ g_jit_ptr_mask);
         if (crypto::fnv1a_64(base, g_vcode_size) == g_vcode_cipher_hash) {
             DWORD old_prot = 0;
             protect_memory_via_syscall(base, g_vcode_size, PAGE_READWRITE, &old_prot);
@@ -509,7 +672,7 @@ JitSectionGuard::JitSectionGuard() noexcept {
     }
     acquire_jit_lock();
     if (g_jit_recursion_depth++ == 0) {
-        auto* base = reinterpret_cast<uint8_t*>(g_vcode_encoded_base ^ kJitPtrMask);
+        auto* base = reinterpret_cast<uint8_t*>(g_vcode_encoded_base ^ g_jit_ptr_mask);
 
         // 1. Verify at-rest ciphertext wasn't modified while locked
         if (crypto::fnv1a_64(base, g_vcode_size) != g_vcode_cipher_hash) {
@@ -539,7 +702,7 @@ JitSectionGuard::~JitSectionGuard() noexcept {
         return;
     }
     if (--g_jit_recursion_depth == 0) {
-        auto* base = reinterpret_cast<uint8_t*>(g_vcode_encoded_base ^ kJitPtrMask);
+        auto* base = reinterpret_cast<uint8_t*>(g_vcode_encoded_base ^ g_jit_ptr_mask);
 
         // 1. Check if a debugger planted a 0xCC breakpoint inside .vcode during execution
         if (crypto::fnv1a_64(base, g_vcode_size) != g_vcode_plain_hash) {
@@ -627,7 +790,115 @@ bool verify_text_integrity(uint64_t expected_hash, void* module_base) noexcept {
     return compute_text_integrity(module_base) == expected_hash && verify_vcode_integrity();
 }
 
-VPACK_INIT_CODE bool erase_pe_headers(void* module_base) noexcept {
+namespace {
+
+// Internal CreateThread replacement backed by NtCreateThreadEx so in-process std::thread /
+// _beginthreadex calls succeed even after the main module's PE headers are 100% wiped in RAM,
+// while external CreateRemoteThread calls from other processes still fail with Error 193!
+HANDLE WINAPI vpack_internal_create_thread(
+    LPSECURITY_ATTRIBUTES lpThreadAttributes,
+    SIZE_T                dwStackSize,
+    LPTHREAD_START_ROUTINE lpStartAddress,
+    LPVOID                lpParameter,
+    DWORD                 dwCreationFlags,
+    LPDWORD               lpThreadId
+) noexcept {
+    (void)lpThreadAttributes;
+    using FnNtCreateThreadEx = LONG(NTAPI*)(
+        PHANDLE, ACCESS_MASK, PVOID, HANDLE, PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID
+    );
+    static auto nt_create = VPACK_IMPORT(FnNtCreateThreadEx, "ntdll.dll", "NtCreateThreadEx");
+    FnNtCreateThreadEx fn = nt_create.get();
+    if (!fn) return nullptr;
+
+    const ULONG create_flags = (dwCreationFlags & CREATE_SUSPENDED) ? 0x1u : 0x0u;
+    SIZE_T commit_size  = (dwStackSize != 0 && !(dwCreationFlags & STACK_SIZE_PARAM_IS_A_RESERVATION))
+        ? dwStackSize : 0x10000;
+    SIZE_T reserve_size = (dwStackSize != 0) ? dwStackSize : 0x100000;
+    if (commit_size > reserve_size) reserve_size = commit_size;
+
+    HANDLE hThread = nullptr;
+    LONG status = fn(
+        &hThread,
+        THREAD_ALL_ACCESS,
+        nullptr,
+        GetCurrentProcess(),
+        reinterpret_cast<PVOID>(lpStartAddress),
+        lpParameter,
+        create_flags,
+        0,
+        commit_size,
+        reserve_size,
+        nullptr
+    );
+    if (status != 0 || !hThread) {
+        SetLastError(ERROR_BAD_EXE_FORMAT);
+        return nullptr;
+    }
+    if (lpThreadId) {
+        using FnGetThreadId = DWORD(WINAPI*)(HANDLE);
+        static auto fn_gtid = VPACK_IMPORT(FnGetThreadId, "kernel32.dll", "GetThreadId");
+        if (fn_gtid.get()) {
+            *lpThreadId = fn_gtid(hThread);
+        }
+    }
+    return hThread;
+}
+
+void redirect_module_createthread_iat(void* mod_base, uintptr_t target_k32, uintptr_t target_kb) noexcept {
+    if (!mod_base) return;
+    auto* base = static_cast<uint8_t*>(mod_base);
+    auto* dos  = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    auto* nt   = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+    const uintptr_t replacement = reinterpret_cast<uintptr_t>(&vpack_internal_create_thread);
+
+    // 1) Redirect the PE DataDirectory IAT entry range (exact IAT, no blind scanning)
+    const auto& iat_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+    if (iat_dir.VirtualAddress != 0 && iat_dir.Size >= sizeof(uintptr_t)) {
+        auto* slots = reinterpret_cast<uintptr_t*>(base + iat_dir.VirtualAddress);
+        const size_t count = iat_dir.Size / sizeof(uintptr_t);
+        for (size_t k = 0; k < count; ++k) {
+            if ((target_k32 && slots[k] == target_k32) || (target_kb && slots[k] == target_kb)) {
+                DWORD old_prot = 0;
+                if (protect_memory_via_syscall(&slots[k], sizeof(uintptr_t), PAGE_READWRITE, &old_prot)) {
+                    slots[k] = replacement;
+                    protect_memory_via_syscall(&slots[k], sizeof(uintptr_t), old_prot, &old_prot);
+                }
+            }
+        }
+    }
+
+    // 2) Fallback: masked-boolean match across non-executable sections (covers
+    //    IATs not covered by the DataDirectory IAT slot and CRT lookup tables).
+    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) continue;
+        const size_t sec_size = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+        if (sec_size < sizeof(uintptr_t)) continue;
+
+        uint8_t* sec_ptr = base + sec->VirtualAddress;
+        const size_t count = sec_size / sizeof(uintptr_t);
+        auto* slots = reinterpret_cast<uintptr_t*>(sec_ptr);
+        for (size_t k = 0; k < count; ++k) {
+            const bool is_target = ((target_k32 != 0) & (slots[k] == target_k32)) |
+                                   ((target_kb   != 0) & (slots[k] == target_kb));
+            if (is_target) {
+                DWORD old_prot = 0;
+                if (protect_memory_via_syscall(&slots[k], sizeof(uintptr_t), PAGE_READWRITE, &old_prot)) {
+                    slots[k] = replacement;
+                    protect_memory_via_syscall(&slots[k], sizeof(uintptr_t), old_prot, &old_prot);
+                }
+            }
+        }
+    }
+}
+
+} // namespace
+
+VPACK_INIT_CODE bool erase_pe_headers(void* module_base, bool keep_skeleton) noexcept {
     if (!module_base) {
         module_base = reinterpret_cast<void*>(GetModuleHandleW(nullptr));
     }
@@ -635,6 +906,19 @@ VPACK_INIT_CODE bool erase_pe_headers(void* module_base) noexcept {
 
     ModuleLayoutInfo unused{};
     query_module_layout(module_base, unused);
+
+    // Redirect in-process IAT slots for CreateThread in main module BEFORE wiping main module headers
+    {
+        const auto ct_k32 = reinterpret_cast<uintptr_t>(
+            resolve_export_by_hash(VPACK_HASH_CI("kernel32.dll"), VPACK_HASH_CI("CreateThread"))
+        );
+        const auto ct_kb = reinterpret_cast<uintptr_t>(
+            resolve_export_by_hash(VPACK_HASH_CI("kernelbase.dll"), VPACK_HASH_CI("CreateThread"))
+        );
+        if (ct_k32 || ct_kb) {
+            redirect_module_createthread_iat(module_base, ct_k32, ct_kb);
+        }
+    }
 
     auto* base = static_cast<uint8_t*>(module_base);
     auto* dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
@@ -652,6 +936,23 @@ VPACK_INIT_CODE bool erase_pe_headers(void* module_base) noexcept {
         header_size = 0x1000;
     }
 
+    // Snapshot the handful of fields the minimal skeleton must keep honest:
+    // the loader maps the image once at process start, but lazily-parsing
+    // consumers (RtlImageNtHeader users, WinHTTP's first-call proxy init,
+    // GetModuleFileName-style version walks) still re-parse these headers at
+    // runtime. A 100% zeroed header region leaves them spinning forever
+    // (observed: WinHttpOpen never returns), so erase everything a dumper
+    // wants (DOS stub, section table, entry point, data directories) while
+    // leaving a structurally valid, information-free PE skeleton.
+    const LONG   lfanew          = dos->e_lfanew;
+    const WORD   machine         = nt->FileHeader.Machine;
+    const WORD   characteristics = nt->FileHeader.Characteristics;
+    const ULONGLONG image_base   = nt->OptionalHeader.ImageBase;
+    const DWORD  size_of_image   = nt->OptionalHeader.SizeOfImage;
+    const DWORD  sec_align        = nt->OptionalHeader.SectionAlignment;
+    const DWORD  file_align      = nt->OptionalHeader.FileAlignment;
+    const WORD   subsystem        = nt->OptionalHeader.Subsystem;
+
     DWORD old_protect = 0;
     if (!protect_memory_via_syscall(base, header_size, PAGE_READWRITE, &old_protect)) {
         return false;
@@ -659,6 +960,47 @@ VPACK_INIT_CODE bool erase_pe_headers(void* module_base) noexcept {
 
     // Wipe 100% of DOS header, DOS stub, NT Headers (FileHeader + OptionalHeader + DataDirectories), and Section headers
     crypto::secure_wipe(base, header_size, 0xE3A985C1D72B4F89ULL);
+
+    if (keep_skeleton) {
+        // Optional minimal parse-safe skeleton (only when PROT_PE_SKELETON is requested):
+        auto* new_dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        new_dos->e_magic  = IMAGE_DOS_SIGNATURE;
+        new_dos->e_lfanew = lfanew;
+
+        auto* new_nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + lfanew);
+        new_nt->Signature                       = IMAGE_NT_SIGNATURE;
+        new_nt->FileHeader.Machine              = machine;
+        new_nt->FileHeader.NumberOfSections     = 0;
+        new_nt->FileHeader.TimeDateStamp        = 0;
+        new_nt->FileHeader.PointerToSymbolTable = 0;
+        new_nt->FileHeader.NumberOfSymbols      = 0;
+        new_nt->FileHeader.SizeOfOptionalHeader = sizeof(new_nt->OptionalHeader);
+        new_nt->FileHeader.Characteristics      = characteristics;
+
+        auto& opt = new_nt->OptionalHeader;
+        opt.Magic                       = IMAGE_NT_OPTIONAL_HDR_MAGIC;
+        opt.AddressOfEntryPoint         = 0;
+        opt.BaseOfCode                  = 0;
+        opt.ImageBase                   = image_base;
+        opt.SectionAlignment            = sec_align;
+        opt.FileAlignment               = file_align;
+        opt.MajorOperatingSystemVersion = 6;
+        opt.MinorOperatingSystemVersion = 1;
+        opt.MajorImageVersion           = 0;
+        opt.MinorImageVersion           = 0;
+        opt.MajorSubsystemVersion       = 6;
+        opt.MinorSubsystemVersion       = 1;
+        opt.SizeOfImage                 = size_of_image;
+        opt.SizeOfHeaders               = header_size;
+        opt.Subsystem                   = subsystem;
+        opt.DllCharacteristics          = 0;
+        opt.SizeOfStackReserve          = 0;
+        opt.SizeOfStackCommit           = 0;
+        opt.SizeOfHeapReserve           = 0;
+        opt.SizeOfHeapCommit            = 0;
+        opt.LoaderFlags                 = 0;
+        opt.NumberOfRvaAndSizes         = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    }
 
     DWORD dummy = 0;
     protect_memory_via_syscall(base, header_size, old_protect, &dummy);
@@ -681,72 +1023,13 @@ VPACK_INIT_CODE bool tamper_peb_image_size(uint32_t fake_size_delta) noexcept {
     if (!curr || curr == head) return false;
 
     auto* entry = reinterpret_cast<LdrDataTableEntryLoadOrderT*>(curr);
-    entry->SizeOfImage += fake_size_delta;
-    entry->EntryPoint   = nullptr;
+    if (g_has_cached_layout && g_cached_main_layout.original_size_of_image != 0) {
+        entry->SizeOfImage = g_cached_main_layout.original_size_of_image + fake_size_delta;
+    } else if (entry->SizeOfImage < 0x01000000u) {
+        entry->SizeOfImage += fake_size_delta;
+    }
+    entry->EntryPoint = nullptr;
     return true;
-}
-
-VPACK_INIT_CODE uint32_t capture_module_baseline() noexcept {
-    g_baseline_module_count = 0;
-    uint8_t* peb = get_peb_mutable();
-    if (!peb) return 0;
-
-#if defined(_M_X64) || defined(__x86_64__)
-    auto* ldr = *reinterpret_cast<PebLdrDataT**>(peb + 0x18);
-#else
-    auto* ldr = *reinterpret_cast<PebLdrDataT**>(peb + 0x0C);
-#endif
-    if (!ldr) return 0;
-
-    LIST_ENTRY* head = &ldr->InLoadOrderModuleList;
-    for (LIST_ENTRY* it = head->Flink; it && it != head; it = it->Flink) {
-        auto* entry = reinterpret_cast<LdrDataTableEntryLoadOrderT*>(it);
-        if (entry->DllBase && g_baseline_module_count < kMaxBaselineModules) {
-            g_baseline_modules[g_baseline_module_count++] = entry->DllBase;
-        }
-    }
-    return static_cast<uint32_t>(g_baseline_module_count);
-}
-
-bool detect_injected_module(void** out_base, char* out_name, size_t max_len) noexcept {
-    if (g_baseline_module_count == 0) return false;
-    uint8_t* peb = get_peb_mutable();
-    if (!peb) return false;
-
-#if defined(_M_X64) || defined(__x86_64__)
-    auto* ldr = *reinterpret_cast<PebLdrDataT**>(peb + 0x18);
-#else
-    auto* ldr = *reinterpret_cast<PebLdrDataT**>(peb + 0x0C);
-#endif
-    if (!ldr) return false;
-
-    LIST_ENTRY* head = &ldr->InLoadOrderModuleList;
-    for (LIST_ENTRY* it = head->Flink; it && it != head; it = it->Flink) {
-        auto* entry = reinterpret_cast<LdrDataTableEntryLoadOrderT*>(it);
-        if (!entry->DllBase) continue;
-
-        bool known = false;
-        for (size_t i = 0; i < g_baseline_module_count; ++i) {
-            if (g_baseline_modules[i] == entry->DllBase) {
-                known = true;
-                break;
-            }
-        }
-
-        if (!known) {
-            if (out_base) *out_base = entry->DllBase;
-            if (out_name && max_len > 0) {
-                size_t chars = entry->BaseDllName.Length / sizeof(wchar_t);
-                size_t copy_len = (chars < max_len - 1) ? chars : (max_len - 1);
-                for (size_t c = 0; c < copy_len; ++c) {
-                    out_name[c] = static_cast<char>(entry->BaseDllName.Buffer[c] & 0xFF);
-                }
-                out_name[copy_len] = '\0';
-            }
-            return true;
-        }
-    }
-    return false;
 }
 
 void* resolve_export_by_hash(uint64_t module_hash_ci, uint64_t proc_hash_ci) noexcept {

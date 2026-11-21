@@ -11,7 +11,7 @@ file(MAKE_DIRECTORY "${VPACK_BIN_DIR}")
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_compile_options(/W4 /permissive- /EHsc /Gy /Gw /MT)
-    add_link_options(/OPT:REF /OPT:ICF)
+    add_link_options(/OPT:REF /OPT:ICF /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT)
 else()
     add_compile_options(
         -Wall -Wextra -Wpedantic
@@ -24,6 +24,9 @@ else()
         -static-libgcc
         -static-libstdc++
         -Wl,--gc-sections
+        -Wl,--dynamicbase
+        -Wl,--high-entropy-va
+        -Wl,--nxcompat
         -Wl,--strip-all
         -s
     )
@@ -35,6 +38,7 @@ set(VPACK_SYS_LIBS Advapi32 User32 Psapi Kernel32 Ntdll)
 add_library(vpack STATIC
     src/crypto.cpp
     src/anti_debug.cpp
+    src/anti_vm.cpp
     src/anti_dump.cpp
     src/page_vault.cpp
     src/vm.cpp
@@ -80,6 +84,25 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/dumper_dll.cpp")
     )
     set_target_properties(dumper_dll PROPERTIES PREFIX "")
     target_link_libraries(dumper_dll PRIVATE ${VPACK_SYS_LIBS})
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/pe_dump_dll.cpp")
+    add_library(pe_dump_dll SHARED
+        tests/pe_dump_dll.cpp
+    )
+    set_target_properties(pe_dump_dll PROPERTIES PREFIX "")
+    target_link_libraries(pe_dump_dll PRIVATE ${VPACK_SYS_LIBS})
+    if(MINGW)
+        # Fully static CRT/libstdc++: the DLL must depend on nothing but
+        # system DLLs so it can be manually mapped into any process.
+        target_link_options(pe_dump_dll PRIVATE -static -static-libgcc -static-libstdc++)
+    endif()
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/manual_mapper.cpp")
+    add_executable(manual_mapper
+        tests/manual_mapper.cpp
+    )
 endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/dll_injector.cpp")

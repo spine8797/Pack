@@ -1,4 +1,5 @@
 #include "vpack/anti_debug.h"
+#include "vpack/anti_vm.h"
 #include "vpack/anti_dump.h"
 #include "vpack/crypto.h"
 
@@ -27,6 +28,16 @@ using FnNtSetInformationThread = LONG(NTAPI*)(
     PVOID ThreadInformation,
     ULONG ThreadInformationLength
 );
+
+using FnNtQueryInformationThread = LONG(NTAPI*)(
+    HANDLE ThreadHandle,
+    ULONG ThreadInformationClass,
+    PVOID ThreadInformation,
+    ULONG ThreadInformationLength,
+    PULONG ReturnLength
+);
+
+thread_local bool g_thread_hidden_requested = false;
 
 using FnNtQuerySystemInformation = LONG(NTAPI*)(
     ULONG SystemInformationClass,
@@ -115,6 +126,153 @@ bool check_nt_global_flag() noexcept {
     return (nt_global_flag & 0x70u) == 0x70u;
 }
 
+bool check_heap_flags() noexcept {
+    const uint8_t* peb = get_peb();
+    if (!peb) return false;
+#if defined(_M_X64) || defined(__x86_64__)
+    const auto* process_heap = *reinterpret_cast<const uint8_t* const*>(peb + 0x30);
+    if (!process_heap) return false;
+    const uint32_t flags       = *reinterpret_cast<const uint32_t*>(process_heap + 0x70);
+    const uint32_t force_flags = *reinterpret_cast<const uint32_t*>(process_heap + 0x74);
+#else
+    const auto* process_heap = *reinterpret_cast<const uint8_t* const*>(peb + 0x18);
+    if (!process_heap) return false;
+    const uint32_t flags       = *reinterpret_cast<const uint32_t*>(process_heap + 0x40);
+    const uint32_t force_flags = *reinterpret_cast<const uint32_t*>(process_heap + 0x44);
+#endif
+    // HEAP_TAIL_CHECKING_ENABLED (0x20) | HEAP_FREE_CHECKING_ENABLED (0x40) | HEAP_VALIDATE_PARAMETERS_ENABLED (0x40000000)
+    return (flags & 0x40000060u) != 0u || force_flags != 0u;
+}
+
+bool check_parent_debugger() noexcept {
+    static volatile LONG s_cache_state = 0; // 0 = uninit, 1 = clean, 2 = debugger parent
+    const LONG cached = InterlockedCompareExchange(&s_cache_state, 0, 0);
+    if (cached != 0) {
+        return cached == 2;
+    }
+
+    struct ProcessBasicInfoLocal {
+        uintptr_t ExitStatus;
+        uintptr_t PebBaseAddress;
+        uintptr_t AffinityMask;
+        uintptr_t BasePriority;
+        uintptr_t UniqueProcessId;
+        uintptr_t InheritedFromUniqueProcessId;
+    } pbi{};
+
+    ULONG ret_len = 0;
+    if (call_nt_query_info_process(GetCurrentProcess(), 0, &pbi, sizeof(pbi), &ret_len) != 0 ||
+        pbi.InheritedFromUniqueProcessId == 0) {
+        InterlockedExchange(&s_cache_state, 1);
+        return false;
+    }
+
+    bool is_dbg_parent = false;
+
+    using FnOpenProcess = HANDLE(WINAPI*)(DWORD, BOOL, DWORD);
+    using FnQueryNameA   = BOOL(WINAPI*)(HANDLE, DWORD, LPSTR, PDWORD);
+    using FnCloseHandle  = BOOL(WINAPI*)(HANDLE);
+    static auto fn_open  = VPACK_IMPORT(FnOpenProcess, "kernel32.dll", "OpenProcess");
+    static auto fn_qname = VPACK_IMPORT(FnQueryNameA, "kernel32.dll", "QueryFullProcessImageNameA");
+    static auto fn_close = VPACK_IMPORT(FnCloseHandle, "kernel32.dll", "CloseHandle");
+
+    if (fn_open.get() && fn_qname.get()) {
+        constexpr DWORD kQueryLimitedInfo = 0x1000u; // PROCESS_QUERY_LIMITED_INFORMATION
+        HANDLE parent = fn_open(
+            kQueryLimitedInfo,
+            FALSE,
+            static_cast<DWORD>(pbi.InheritedFromUniqueProcessId)
+        );
+        if (parent) {
+            char path[MAX_PATH * 2]{};
+            DWORD name_size = static_cast<DWORD>(sizeof(path));
+            if (fn_qname(parent, 0, path, &name_size)) {
+                const char* base_name = path;
+                for (const char* p = path; *p; ++p) {
+                    if (*p == '\\' || *p == '/') {
+                        base_name = p + 1;
+                    }
+                }
+                const uint64_t parent_hash = crypto::fnv1a_64_ci(base_name);
+                constexpr uint64_t kDebuggerHashes[] = {
+                    VPACK_HASH_CI("x64dbg.exe"),
+                    VPACK_HASH_CI("x32dbg.exe"),
+                    VPACK_HASH_CI("x96dbg.exe"),
+                    VPACK_HASH_CI("ida.exe"),
+                    VPACK_HASH_CI("ida64.exe"),
+                    VPACK_HASH_CI("idag.exe"),
+                    VPACK_HASH_CI("idag64.exe"),
+                    VPACK_HASH_CI("idaq.exe"),
+                    VPACK_HASH_CI("idaq64.exe"),
+                    VPACK_HASH_CI("windbg.exe"),
+                    VPACK_HASH_CI("windbgx.exe"),
+                    VPACK_HASH_CI("ollydbg.exe"),
+                    VPACK_HASH_CI("ollyice.exe"),
+                    VPACK_HASH_CI("radare2.exe"),
+                    VPACK_HASH_CI("r2.exe"),
+                    VPACK_HASH_CI("rabin2.exe"),
+                    VPACK_HASH_CI("cutter.exe"),
+                    VPACK_HASH_CI("ghidra.exe"),
+                    VPACK_HASH_CI("cheatengine-x86_64.exe"),
+                    VPACK_HASH_CI("cheatengine-x86_64-sse4-avx2.exe"),
+                    VPACK_HASH_CI("hyperdbg-cli.exe"),
+                    VPACK_HASH_CI("dbg64.exe")
+                };
+                for (uint64_t dh : kDebuggerHashes) {
+                    if (parent_hash == dh) {
+                        is_dbg_parent = true;
+                        break;
+                    }
+                }
+            }
+            crypto::secure_wipe(path, sizeof(path), pbi.InheritedFromUniqueProcessId);
+            if (fn_close.get()) {
+                fn_close(parent);
+            }
+        }
+    }
+
+    InterlockedExchange(&s_cache_state, is_dbg_parent ? 2 : 1);
+    return is_dbg_parent;
+}
+
+bool verify_thread_hidden() noexcept {
+    if (!g_thread_hidden_requested) {
+        return true;
+    }
+
+    static antidump::SyscallEntry sc_qthread{};
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = antidump::resolve_ntdll_syscall(VPACK_HASH_CI("NtQueryInformationThread"), sc_qthread);
+    }
+
+    BOOLEAN is_hidden = 1;
+    ULONG   ret_len   = 0;
+    LONG    status    = -1;
+
+    if (resolved && sc_qthread.gadget_addr && sc_qthread.ssn != 0xFFFFFFFFu) {
+        status = static_cast<LONG>(antidump::invoke_indirect_syscall(
+            sc_qthread,
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(GetCurrentThread())),
+            0x11ULL, // ThreadHideFromDebugger
+            reinterpret_cast<uint64_t>(&is_hidden),
+            sizeof(BOOLEAN),
+            reinterpret_cast<uint64_t>(&ret_len)
+        ));
+    } else {
+        static auto nt_qthread = VPACK_IMPORT(FnNtQueryInformationThread, "ntdll.dll", "NtQueryInformationThread");
+        if (nt_qthread.get()) {
+            status = nt_qthread(GetCurrentThread(), 0x11u, &is_hidden, sizeof(BOOLEAN), &ret_len);
+        }
+    }
+
+    if (status == 0 && is_hidden == 0) {
+        return false; // ScyllaHide / TitanHide suppressed ThreadHideFromDebugger!
+    }
+    return true;
+}
+
 bool check_kuser_shared_data() noexcept {
     // KUSER_SHARED_DATA at fixed address 0x7FFE0000 on all x64 Windows kernels:
     // +0x2D4: BOOLEAN KdDebuggerEnabled (bit 0 = enabled, bit 1 = not present)
@@ -188,7 +346,7 @@ bool check_kernel_debugger() noexcept {
             "NtQuerySystemInformation"
         );
         if (nt_query_sys.get()) {
-            status = nt_query_sys(0x23, &info, sizeof(info), nullptr);
+            status = nt_query_sys(0x23, &info, static_cast<ULONG>(sizeof(info)), nullptr);
         }
     }
 
@@ -201,24 +359,39 @@ bool check_kernel_debugger() noexcept {
 }
 
 bool check_and_clear_hardware_breakpoints(bool clear_if_found, uint32_t* out_count) noexcept {
-    using FnGetThreadContext = BOOL(WINAPI*)(HANDLE, LPCONTEXT);
-    using FnSetThreadContext = BOOL(WINAPI*)(HANDLE, const CONTEXT*);
-
-    static auto fn_get_ctx = VPACK_IMPORT(FnGetThreadContext, "kernel32.dll", "GetThreadContext");
-    static auto fn_set_ctx = VPACK_IMPORT(FnSetThreadContext, "kernel32.dll", "SetThreadContext");
-
-    if (!fn_get_ctx.get()) {
-        if (out_count) *out_count = 0;
-        return false;
+    static antidump::SyscallEntry sc_get_ctx{};
+    static antidump::SyscallEntry sc_set_ctx{};
+    static bool sc_resolved = false;
+    if (!sc_resolved) {
+        antidump::resolve_ntdll_syscall(VPACK_HASH_CI("NtGetContextThread"), sc_get_ctx);
+        antidump::resolve_ntdll_syscall(VPACK_HASH_CI("NtSetContextThread"), sc_set_ctx);
+        sc_resolved = true;
     }
 
-    CONTEXT ctx{};
+    alignas(16) CONTEXT ctx{};
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
 
     HANDLE thread = GetCurrentThread();
-    if (!fn_get_ctx(thread, &ctx)) {
-        if (out_count) *out_count = 0;
-        return false;
+    bool got_ctx = false;
+
+    // 1. Primary path: Indirect Syscall to NtGetContextThread (bypasses ScyllaHide hook)
+    if (sc_get_ctx.gadget_addr && sc_get_ctx.ssn != 0xFFFFFFFFu) {
+        LONG status = static_cast<LONG>(antidump::invoke_indirect_syscall(
+            sc_get_ctx,
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(thread)),
+            reinterpret_cast<uint64_t>(&ctx)
+        ));
+        got_ctx = (status == 0);
+    }
+
+    // 2. Fallback if Indirect Syscall unavailable
+    if (!got_ctx) {
+        using FnGetThreadContext = BOOL(WINAPI*)(HANDLE, LPCONTEXT);
+        static auto fn_get_ctx = VPACK_IMPORT(FnGetThreadContext, "kernel32.dll", "GetThreadContext");
+        if (!fn_get_ctx.get() || !fn_get_ctx(thread, &ctx)) {
+            if (out_count) *out_count = 0;
+            return false;
+        }
     }
 
     uint32_t count = 0;
@@ -230,14 +403,30 @@ bool check_and_clear_hardware_breakpoints(bool clear_if_found, uint32_t* out_cou
 
     if (out_count) *out_count = count;
 
-    if (count > 0 && clear_if_found && fn_set_ctx.get()) {
+    if (count > 0 && clear_if_found) {
         ctx.Dr0 = 0;
         ctx.Dr1 = 0;
         ctx.Dr2 = 0;
         ctx.Dr3 = 0;
         ctx.Dr6 = 0;
         ctx.Dr7 = 0;
-        fn_set_ctx(thread, &ctx);
+
+        bool set_ok = false;
+        if (sc_set_ctx.gadget_addr && sc_set_ctx.ssn != 0xFFFFFFFFu) {
+            LONG status = static_cast<LONG>(antidump::invoke_indirect_syscall(
+                sc_set_ctx,
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(thread)),
+                reinterpret_cast<uint64_t>(&ctx)
+            ));
+            set_ok = (status == 0);
+        }
+        if (!set_ok) {
+            using FnSetThreadContext = BOOL(WINAPI*)(HANDLE, const CONTEXT*);
+            static auto fn_set_ctx = VPACK_IMPORT(FnSetThreadContext, "kernel32.dll", "SetThreadContext");
+            if (fn_set_ctx.get()) {
+                fn_set_ctx(thread, &ctx);
+            }
+        }
     }
 
     return count > 0;
@@ -311,6 +500,18 @@ uint64_t compute_environmental_key_poison() noexcept {
     if (!antidump::verify_vcode_integrity()) {
         poison ^= 0xC0DEC0FFEEBADBEEULL;
     }
+    if (check_heap_flags()) {
+        poison ^= 0x7E4AF1A65BADF00DULL;
+    }
+    if (check_parent_debugger()) {
+        poison ^= 0x9A8B7C6D5E4F3A21ULL;
+    }
+    if (!verify_thread_hidden()) {
+        poison ^= 0xF00DBABE1337CAFEULL;
+    }
+
+    // Mix branchless Anti-VM / Hypervisor poison (0ULL on physical hardware & VBS Root Partition)
+    poison = crypto::mba_xor(poison, antivm::compute_vm_key_poison());
 
     return poison;
 }
@@ -331,7 +532,10 @@ bool hide_current_thread() noexcept {
             0ULL,
             0ULL
         ));
-        if (status == 0) return true;
+        if (status == 0) {
+            g_thread_hidden_requested = true;
+            return true;
+        }
     }
 
     static auto nt_set_thread = VPACK_IMPORT(
@@ -344,7 +548,11 @@ bool hide_current_thread() noexcept {
     if (!fn) return false;
 
     LONG status = fn(GetCurrentThread(), 0x11, nullptr, 0);
-    return status == 0;
+    if (status == 0) {
+        g_thread_hidden_requested = true;
+        return true;
+    }
+    return false;
 }
 
 namespace {
@@ -368,32 +576,61 @@ unsigned long __stdcall hidden_thread_entry(void* param) noexcept {
 } // namespace
 
 void* spawn_hidden_thread(std::function<void()> task) noexcept {
-    static auto nt_create_thread = VPACK_IMPORT(
-        FnNtCreateThreadEx,
-        "ntdll.dll",
-        "NtCreateThreadEx"
-    );
-
-    FnNtCreateThreadEx fn = nt_create_thread.get();
-    if (!fn) return nullptr;
+    static antidump::SyscallEntry sc_create_thread{};
+    static bool sc_resolved = false;
+    if (!sc_resolved) {
+        sc_resolved = antidump::resolve_ntdll_syscall(VPACK_HASH_CI("NtCreateThreadEx"), sc_create_thread);
+    }
 
     auto* ctx = new (std::nothrow) HiddenThreadCtx{std::move(task)};
     if (!ctx) return nullptr;
 
+    constexpr ULONG kThreadCreateHideFromDebugger = 0x00000004u;
     HANDLE hThread = nullptr;
-    LONG status = fn(
-        &hThread,
-        THREAD_ALL_ACCESS,
-        nullptr,
-        GetCurrentProcess(),
-        reinterpret_cast<PVOID>(&hidden_thread_entry),
-        ctx,
-        0,
-        0,
-        0x10000,
-        0x100000,
-        nullptr
-    );
+    LONG   status  = -1;
+
+    // 1. Primary path: Indirect Syscall to NtCreateThreadEx with THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER (0x04)
+    if (sc_resolved && sc_create_thread.gadget_addr && sc_create_thread.ssn != 0xFFFFFFFFu) {
+        status = static_cast<LONG>(antidump::invoke_indirect_syscall(
+            sc_create_thread,
+            reinterpret_cast<uint64_t>(&hThread),
+            static_cast<uint64_t>(THREAD_ALL_ACCESS),
+            0ULL,
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(GetCurrentProcess())),
+            reinterpret_cast<uint64_t>(&hidden_thread_entry),
+            reinterpret_cast<uint64_t>(ctx),
+            static_cast<uint64_t>(kThreadCreateHideFromDebugger),
+            0ULL,
+            0x10000ULL,
+            0x100000ULL,
+            0ULL
+        ));
+    }
+
+    // 2. Fallback to imported NtCreateThreadEx if needed
+    if (status != 0 || !hThread) {
+        static auto nt_create_thread = VPACK_IMPORT(
+            FnNtCreateThreadEx,
+            "ntdll.dll",
+            "NtCreateThreadEx"
+        );
+        FnNtCreateThreadEx fn = nt_create_thread.get();
+        if (fn) {
+            status = fn(
+                &hThread,
+                THREAD_ALL_ACCESS,
+                nullptr,
+                GetCurrentProcess(),
+                reinterpret_cast<PVOID>(&hidden_thread_entry),
+                ctx,
+                kThreadCreateHideFromDebugger,
+                0,
+                0x10000,
+                0x100000,
+                nullptr
+            );
+        }
+    }
 
     if (status != 0 || !hThread) {
         delete ctx;
@@ -421,6 +658,15 @@ DebugReport run_all_checks(bool clear_hwbp) noexcept {
     if (check_nt_global_flag()) {
         report.flags |= THREAT_NT_GLOBAL_FLAG;
     }
+    if (check_heap_flags()) {
+        report.flags |= THREAT_HEAP_FLAGS;
+    }
+    if (check_parent_debugger()) {
+        report.flags |= THREAT_PARENT_DEBUGGER;
+    }
+    if (!verify_thread_hidden()) {
+        report.flags |= THREAT_THREAD_HIDE_BYPASS;
+    }
 
     report.flags |= check_nt_query_debug();
 
@@ -446,6 +692,10 @@ DebugReport run_all_checks(bool clear_hwbp) noexcept {
 
     if (!antidump::verify_vcode_integrity()) {
         report.flags |= THREAT_VCODE_TAMPERED;
+    }
+
+    if (antivm::is_running_in_vm(nullptr)) {
+        report.flags |= THREAT_VIRTUAL_MACHINE;
     }
 
     return report;

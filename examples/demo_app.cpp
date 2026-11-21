@@ -106,7 +106,10 @@ int main(int argc, char** argv) {
               << VPACK_STR("    - Process ID (PID)       : ") << std::dec << pid << "\n"
               << VPACK_STR("    - Base Address           : 0x") << std::hex << reinterpret_cast<uintptr_t>(module_base) << "\n"
               << VPACK_STR("    - Packed Binary (.vpack) : ") << (status.packed_binary ? VPACK_STR("YES") : VPACK_STR("NO (Unpacked Dev Build)")) << "\n"
+              << VPACK_STR("    - .text Page Vault       : ") << (vpack::vault::active() ? VPACK_STR("ACTIVE (Lazy 4KB VEH + PAGE_NOACCESS)") : VPACK_STR("INACTIVE")) << "\n"
               << VPACK_STR("    - .vcode JIT Vault       : ") << (vpack::antidump::is_vcode_jit_active() ? VPACK_STR("ACTIVE (Encrypted & PAGE_READONLY at Rest)") : VPACK_STR("INACTIVE")) << "\n"
+              << VPACK_STR("    - Anti-VM / Hypervisor   : ") << (status.initial_vm_report.is_virtual_machine() ? VPACK_STR("VM DETECTED") : VPACK_STR("PHYSICAL HOST / VBS ROOT [CLEAN]"))
+              << VPACK_STR(" (CPUID min: ") << std::dec << status.initial_vm_report.min_cpuid_cycles << VPACK_STR(" cyc)\n")
               << VPACK_STR("    - x64->VM Lifter & Shred : ")
               << (lift_rep.aot_pre_lifted ? VPACK_STR("AOT PRE-SHREDDED ON DISK (") : VPACK_STR("RUNTIME SHREDDED ("))
               << std::dec << lift_rep.decoded_insns << VPACK_STR(" x64 insns -> ")
@@ -178,11 +181,7 @@ int main(int argc, char** argv) {
                   << VPACK_STR("(G#") << std::dec << vpack::antidump::vcode_jit_generation() << ") | "
                   << VPACK_STR("VM:") << ((cur_vm_ok && cur_vm == expected_vm) ? VPACK_STR("OK") : VPACK_STR("TAMPERED"));
 
-        if (rep.flags & vpack::antidebug::THREAT_DLL_INJECTED) {
-            std::cout << VPACK_STR(" | [!] INJECTED DLL DETECTED: ")
-                      << rep.injected_module_name
-                      << VPACK_STR(" @ 0x") << std::hex << reinterpret_cast<uintptr_t>(rep.injected_module_base);
-        } else if (rep.detected()) {
+        if (rep.detected()) {
             std::cout << VPACK_STR(" | [!] THREAT FLAGS: 0x") << std::hex << rep.flags;
         } else {
             std::cout << VPACK_STR(" | Status: SECURE");

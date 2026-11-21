@@ -27,27 +27,32 @@
 #ifndef VPACK_PAGE_VAULT_H
 #define VPACK_PAGE_VAULT_H
 
+#include "vpack/config.h"
 #include <cstdint>
 #include <cstddef>
 
 namespace vpack::vault {
 
 // Bat lazy vault cho vung code [code_base, code_base+code_size).
-// - copy cipher -> heap NOACCESS (an toan khi idle)
-// - dat toan vung NOACCESS + cai VEH
+// - Neu cipher == nullptr: tu dong ma hoa in-place tu code_base (da relocate ASLR) vao heap cipher master.
+// - copy/encrypt cipher -> heap NOACCESS (con tro duoc XOR-mask trong RAM)
+// - dat toan vung NOACCESS + cai VEH (toan bo handler nam trong section .vpvlt rieng biet)
 // - code_base phai page-aligned
-bool install(void* code_base, size_t code_size,
+VPACK_VAULT_CODE bool install(void* code_base, size_t code_size,
              const uint8_t* cipher, uint64_t master_seed) noexcept;
 
+// Dong bo lai cipher master neu mot doan code trong .text duoc patch hop le (vd: runtime virtualizer)
+VPACK_VAULT_CODE void sync_modified_range(const void* address, size_t size) noexcept;
+
 // Tat vault (restore trang thai - dung cho test/unload)
-void uninstall() noexcept;
+VPACK_VAULT_CODE void uninstall() noexcept;
 
 // true khi vault dang hoat dong
-bool active() noexcept;
+VPACK_VAULT_CODE bool active() noexcept;
 
 // FNV-1a cua CIPHER MASTER (khong doi khi decrypt/retire)
 // -> dung thay cho live .text hash trong integrity check
-uint64_t cipher_hash() noexcept;
+VPACK_VAULT_CODE uint64_t cipher_hash() noexcept;
 
 } // namespace vpack::vault
 

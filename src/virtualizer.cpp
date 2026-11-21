@@ -1,6 +1,7 @@
 #include "vpack/virtualizer.h"
 #include "vpack/anti_dump.h"
 #include "vpack/anti_debug.h"
+#include "vpack/page_vault.h"
 #include "vpack/crypto.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -14,8 +15,6 @@
 namespace vpack::virtualizer {
 
 namespace {
-
-constexpr size_t kMaxVirtualizedSlots = 16;
 
 struct VirtualizedSlot {
     bool          occupied = false;
@@ -198,8 +197,8 @@ bool decode_one_x64(const uint8_t* code, size_t max_len, size_t offset, DecodedI
 
     out.opcode = op;
 
-    // Single-byte NOP (0x90) or RET (0xC3)
-    if (op == 0x90) {
+    // Single-byte NOP (0x90), CDQE/CWDE (0x98), CQO/CDQ (0x99), or RET (0xC3)
+    if (op == 0x90 || op == 0x98 || op == 0x99) {
         out.length = pos - offset;
         return true;
     }
@@ -228,6 +227,16 @@ bool decode_one_x64(const uint8_t* code, size_t max_len, size_t offset, DecodedI
         return true;
     }
 
+    // Near CALL (E8 cd)
+    if (op == 0xE8) {
+        if (pos + 4 > max_len) return false;
+        int32_t rel = read_le_i32(code + pos);
+        pos += 4;
+        out.disp   = static_cast<int64_t>(rel);
+        out.length = pos - offset;
+        return true;
+    }
+
     // Near JMP (E9 cd)
     if (op == 0xE9) {
         if (pos + 4 > max_len) return false;
@@ -237,6 +246,15 @@ bool decode_one_x64(const uint8_t* code, size_t max_len, size_t offset, DecodedI
         out.is_uncond_jmp = true;
         out.length        = pos - offset;
         out.branch_target = static_cast<size_t>(static_cast<intptr_t>(pos) + rel);
+        return true;
+    }
+
+    // MOV r8, imm8 (B0..B7)
+    if (op >= 0xB0 && op <= 0xB7) {
+        if (pos >= max_len) return false;
+        out.rm     = static_cast<uint8_t>((op & 7u) | (out.rex_b ? 8u : 0u));
+        out.imm    = code[pos++];
+        out.length = pos - offset;
         return true;
     }
 
@@ -274,22 +292,28 @@ bool decode_one_x64(const uint8_t* code, size_t max_len, size_t offset, DecodedI
     }
 
     // Standard ModR/M instructions (no immediate)
-    if (op == 0x89 || op == 0x8B || op == 0x8D || op == 0x63 ||
+    if (op == 0x88 || op == 0x89 || op == 0x8A || op == 0x8B || op == 0x8D || op == 0x63 ||
         op == 0x01 || op == 0x03 || op == 0x09 || op == 0x0B ||
         op == 0x21 || op == 0x23 || op == 0x29 || op == 0x2B ||
         op == 0x31 || op == 0x33 || op == 0x39 || op == 0x3B ||
-        op == 0x84 || op == 0x85 || op == 0xD1 || op == 0xD3 || op == 0xFF) {
+        op == 0x84 || op == 0x85 || op == 0xD1 || op == 0xD3 || op == 0xFE || op == 0xFF) {
         if (!decode_modrm_sib_disp(code, max_len, pos, out)) return false;
+        if (op == 0xFF) {
+            const uint8_t subop = out.reg & 7u;
+            if (subop != 0u && subop != 1u && subop != 2u && subop != 6u) {
+                return false; // Reject indirect JMP (/4) or unsupported subops
+            }
+        }
         out.length = pos - offset;
         return true;
     }
 
-    // ModR/M + imm8: 83 /0..7 ib, C1 /0..7 ib, 6B /r ib, C6 /0 ib
-    if (op == 0x83 || op == 0xC1 || op == 0x6B || op == 0xC6) {
+    // ModR/M + imm8: 80 /0..7 ib, 83 /0..7 ib, C0 /0..7 ib, C1 /0..7 ib, 6B /r ib, C6 /0 ib
+    if (op == 0x80 || op == 0x83 || op == 0xC0 || op == 0xC1 || op == 0x6B || op == 0xC6) {
         if (!decode_modrm_sib_disp(code, max_len, pos, out)) return false;
         if (pos >= max_len) return false;
         int8_t imm8 = static_cast<int8_t>(code[pos++]);
-        if (op == 0xC1 || op == 0xC6) {
+        if (op == 0x80 || op == 0xC0 || op == 0xC1 || op == 0xC6) {
             out.imm = static_cast<uint8_t>(imm8);
         } else {
             out.imm = out.rex_w ? static_cast<uint64_t>(static_cast<int64_t>(imm8))
@@ -334,18 +358,27 @@ bool decode_one_x64(const uint8_t* code, size_t max_len, size_t offset, DecodedI
     return false;
 }
 
-// Emits effective address calculation into `dst_reg` using Non-Linear MBA micro-ops
+// Emits effective address calculation into `dst_reg` using flagless Non-Linear MBA micro-ops
+// and dedicated scratch register `VTMP2` (never clobbers `VTMP1` or `ctx.flags`!)
 void emit_effective_address(
     vm::BytecodeBuilder& b,
     const uint8_t*       fn_base,
     const DecodedInsn&   insn,
-    vm::VmReg            dst_reg
+    vm::VmReg            dst_reg,
+    uint32_t             fn_rva = 0
 ) {
     using namespace vpack::vm;
     if (insn.rip_relative) {
-        const uint64_t target_addr = reinterpret_cast<uint64_t>(fn_base + insn.offset + insn.length) +
-                                     static_cast<uint64_t>(insn.disp);
-        b.mov_imm(dst_reg, target_addr);
+        if (fn_rva != 0) {
+            const uint64_t target_rva = static_cast<uint64_t>(fn_rva + insn.offset + insn.length) +
+                                        static_cast<uint64_t>(insn.disp);
+            b.mov_imm(dst_reg, target_rva)
+             .add_image_base(dst_reg);
+        } else {
+            const uint64_t target_addr = reinterpret_cast<uint64_t>(fn_base + insn.offset + insn.length) +
+                                         static_cast<uint64_t>(insn.disp);
+            b.mov_imm(dst_reg, target_addr);
+        }
         return;
     }
 
@@ -359,15 +392,15 @@ void emit_effective_address(
         if (!initialized) {
             b.mov_reg(dst_reg, static_cast<VmReg>(insn.index_reg));
             if (insn.scale_shift > 0) {
-                b.shl_imm(dst_reg, insn.scale_shift);
+                b.lea_shl(dst_reg, insn.scale_shift);
             }
             initialized = true;
         } else {
-            b.mov_reg(VTMP1, static_cast<VmReg>(insn.index_reg));
+            b.mov_reg(VTMP2, static_cast<VmReg>(insn.index_reg));
             if (insn.scale_shift > 0) {
-                b.shl_imm(VTMP1, insn.scale_shift);
+                b.lea_shl(VTMP2, insn.scale_shift);
             }
-            b.mba_add(dst_reg, VTMP1);
+            b.lea_add(dst_reg, VTMP2);
         }
     }
 
@@ -375,25 +408,143 @@ void emit_effective_address(
         if (!initialized) {
             b.mov_imm(dst_reg, static_cast<uint64_t>(insn.disp));
         } else {
-            b.mov_imm(VTMP1, static_cast<uint64_t>(insn.disp));
-            b.mba_add(dst_reg, VTMP1);
+            b.mov_imm(VTMP2, static_cast<uint64_t>(insn.disp));
+            b.lea_add(dst_reg, VTMP2);
         }
     }
+}
+
+uint8_t default_operand_bytes(const DecodedInsn& insn) noexcept {
+    if (insn.rex_w) return 8;
+    if (insn.has_66) return 2;
+    return 4;
+}
+
+// In x86_64, 8-bit register encodings 4..7 without a REX prefix refer to AH, CH, DH, BH
+// (bits [8..15] of RAX, RCX, RDX, RBX) rather than SPL, BPL, SIL, DIL (R4..R7)!
+bool is_high_byte_8bit_reg(const DecodedInsn& insn, uint8_t reg_code) noexcept {
+    return !insn.has_rex && (reg_code >= 4u && reg_code <= 7u);
+}
+
+vm::VmReg load_reg8(
+    vm::BytecodeBuilder& b,
+    const DecodedInsn&   insn,
+    uint8_t              reg_code,
+    vm::VmReg            scratch_reg
+) {
+    using namespace vpack::vm;
+    b.save_flags();
+    if (is_high_byte_8bit_reg(insn, reg_code)) {
+        const auto base_reg = static_cast<VmReg>(reg_code - 4u);
+        b.mov_reg(scratch_reg, base_reg)
+         .shr_imm(scratch_reg, 8)
+         .mov_imm(VTMP2, 0xFFULL)
+         .and_reg(scratch_reg, VTMP2);
+    } else {
+        b.mov_reg(scratch_reg, static_cast<VmReg>(reg_code))
+         .mov_imm(VTMP2, 0xFFULL)
+         .and_reg(scratch_reg, VTMP2);
+    }
+    b.restore_flags();
+    return scratch_reg;
+}
+
+void write_reg8_preserve(
+    vm::BytecodeBuilder& b,
+    const DecodedInsn&   insn,
+    uint8_t              reg_code,
+    vm::VmReg            val_reg
+) {
+    using namespace vpack::vm;
+    b.save_flags();
+    if (val_reg != VTMP1) {
+        b.mov_reg(VTMP1, val_reg);
+    }
+    b.mov_imm(VTMP2, 0xFFULL)
+     .and_reg(VTMP1, VTMP2);
+
+    if (is_high_byte_8bit_reg(insn, reg_code)) {
+        const auto dst = static_cast<VmReg>(reg_code - 4u);
+        b.shl_imm(VTMP1, 8)
+         .mov_imm(VTMP2, ~0xFF00ULL)
+         .and_reg(dst, VTMP2)
+         .or_reg(dst, VTMP1);
+    } else {
+        const auto dst = static_cast<VmReg>(reg_code);
+        b.mov_imm(VTMP2, ~0xFFULL)
+         .and_reg(dst, VTMP2)
+         .or_reg(dst, VTMP1);
+    }
+    b.restore_flags();
 }
 
 vm::VmReg load_rm_operand(
     vm::BytecodeBuilder& b,
     const uint8_t*       fn_base,
     const DecodedInsn&   insn,
-    vm::VmReg            scratch_reg = vm::VTMP0
+    vm::VmReg            scratch_reg = vm::VTMP0,
+    uint8_t              width_bytes = 0,
+    uint32_t             fn_rva = 0
 ) {
     using namespace vpack::vm;
+    const uint8_t bytes = (width_bytes != 0) ? width_bytes : default_operand_bytes(insn);
     if (insn.mod == 3u) {
-        return static_cast<VmReg>(insn.rm);
+        if (bytes == 1) {
+            return load_reg8(b, insn, insn.rm, scratch_reg);
+        }
+        const auto reg = static_cast<VmReg>(insn.rm);
+        if (bytes == 2) {
+            b.save_flags()
+             .mov_reg(scratch_reg, reg)
+             .mov_imm(VTMP2, 0xFFFFULL)
+             .and_reg(scratch_reg, VTMP2)
+             .restore_flags();
+            return scratch_reg;
+        }
+        if (bytes == 4) {
+            b.movzx32(scratch_reg, reg);
+            return scratch_reg;
+        }
+        return reg;
     }
-    emit_effective_address(b, fn_base, insn, scratch_reg);
-    b.load64(scratch_reg, scratch_reg);
+    emit_effective_address(b, fn_base, insn, scratch_reg, fn_rva);
+    if (bytes == 1)      b.load8(scratch_reg, scratch_reg);
+    else if (bytes == 2) b.load16(scratch_reg, scratch_reg);
+    else if (bytes == 4) b.load32(scratch_reg, scratch_reg);
+    else                 b.load64(scratch_reg, scratch_reg);
     return scratch_reg;
+}
+
+void write_subreg_preserve_high(
+    vm::BytecodeBuilder& b,
+    vm::VmReg            dst,
+    vm::VmReg            val_reg,
+    uint8_t              bytes
+) {
+    using namespace vpack::vm;
+    if (bytes == 1) {
+        b.save_flags();
+        if (val_reg != VTMP1) b.mov_reg(VTMP1, val_reg);
+        b.mov_imm(VTMP2, 0xFFULL)
+         .and_reg(VTMP1, VTMP2)
+         .mov_imm(VTMP2, ~0xFFULL)
+         .and_reg(dst, VTMP2)
+         .or_reg(dst, VTMP1)
+         .restore_flags();
+    } else if (bytes == 2) {
+        b.save_flags();
+        if (val_reg != VTMP1) b.mov_reg(VTMP1, val_reg);
+        b.mov_imm(VTMP2, 0xFFFFULL)
+         .and_reg(VTMP1, VTMP2)
+         .mov_imm(VTMP2, ~0xFFFFULL)
+         .and_reg(dst, VTMP2)
+         .or_reg(dst, VTMP1)
+         .restore_flags();
+    } else if (bytes == 4) {
+        b.movzx32(dst, val_reg);
+    } else if (dst != val_reg) {
+        b.mov_reg(dst, val_reg);
+    }
 }
 
 void store_rm_operand(
@@ -401,31 +552,92 @@ void store_rm_operand(
     const uint8_t*       fn_base,
     const DecodedInsn&   insn,
     vm::VmReg            val_reg,
-    bool                 zero_ext_32
+    bool                 zero_ext_32,
+    uint8_t              width_bytes = 0,
+    uint32_t             fn_rva = 0
 ) {
     using namespace vpack::vm;
-    if (zero_ext_32) {
-        b.movzx32(val_reg, val_reg);
-    }
+    const uint8_t bytes = (width_bytes != 0)
+        ? width_bytes
+        : (zero_ext_32 ? (insn.has_66 ? 2u : 4u) : 8u);
+
     if (insn.mod == 3u) {
-        const auto dst = static_cast<VmReg>(insn.rm);
-        if (dst != val_reg) {
-            b.mov_reg(dst, val_reg);
+        if (bytes == 1) {
+            write_reg8_preserve(b, insn, insn.rm, val_reg);
+            return;
         }
+        const auto dst = static_cast<VmReg>(insn.rm);
+        write_subreg_preserve_high(b, dst, val_reg, bytes);
         return;
     }
-    emit_effective_address(b, fn_base, insn, VTMP0);
-    b.store64(VTMP0, val_reg);
+
+    if (bytes == 4) {
+        b.movzx32(val_reg, val_reg);
+    }
+    emit_effective_address(b, fn_base, insn, VTMP0, fn_rva);
+    if (bytes == 1)      b.store8(VTMP0, val_reg);
+    else if (bytes == 2) b.store16(VTMP0, val_reg);
+    else if (bytes == 4) b.store32(VTMP0, val_reg);
+    else                 b.store64(VTMP0, val_reg);
+}
+
+// Evaluates x86_64 ADD/SUB/ALU flags (CF, OF, ZF, SF) at exact 8-bit, 16-bit, 32-bit, or 64-bit width
+// by shifting the sub-register operands to the MSB (64-bit boundary) before performing the MBA operation!
+void emit_sized_alu_op(
+    vm::BytecodeBuilder& b,
+    uint8_t              alu_kind, // 0=ADD, 1=OR, 4=AND, 5=SUB, 6=XOR
+    vm::VmReg            dst,
+    vm::VmReg            rhs,
+    uint8_t              bytes
+) {
+    using namespace vpack::vm;
+    const uint8_t shift = (bytes == 1) ? 56u : ((bytes == 2) ? 48u : ((bytes == 4) ? 32u : 0u));
+
+    if (shift == 0) {
+        if (alu_kind == 0u)      b.mba_add(dst, rhs);
+        else if (alu_kind == 5u) b.mba_sub(dst, rhs);
+        else if (alu_kind == 6u) b.mba_xor(dst, rhs);
+        else if (alu_kind == 4u) b.and_reg(dst, rhs);
+        else if (alu_kind == 1u) b.or_reg(dst, rhs);
+        return;
+    }
+
+    if (alu_kind == 0u || alu_kind == 5u) {
+        // Shift both lhs and rhs to top of 64-bit word so 64-bit carry/overflow/sign/zero
+        // identically match the N-bit hardware flags, while computing the unshifted result in dst!
+        if (rhs != VTMP0) b.mov_reg(VTMP0, rhs);
+        b.mov_reg(VTMP2, dst)
+         .lea_shl(VTMP2, shift)
+         .lea_shl(VTMP0, shift);
+        if (alu_kind == 0u) {
+            b.mba_add(dst, rhs)
+             .mba_add(VTMP2, VTMP0);
+        } else {
+            b.mba_sub(dst, rhs)
+             .mba_sub(VTMP2, VTMP0);
+        }
+    } else {
+        if (alu_kind == 6u)      b.mba_xor(dst, rhs);
+        else if (alu_kind == 4u) b.and_reg(dst, rhs);
+        else if (alu_kind == 1u) b.or_reg(dst, rhs);
+        b.mov_reg(VTMP2, dst)
+         .lea_shl(VTMP2, shift)
+         .or_reg(VTMP2, VTMP2); // Sets 64-bit ZF/SF from shifted N-bit result and clears CF/OF
+    }
 }
 
 void emit_jcc_by_code(vm::BytecodeBuilder& b, uint8_t cond, const std::string& lbl) {
     switch (cond & 0x0Fu) {
+        case 0x0: b.jo(lbl);  break; // JO
+        case 0x1: b.jno(lbl); break; // JNO
         case 0x2: b.jb(lbl);  break; // JB / JC / JNAE
         case 0x3: b.jae(lbl); break; // JAE / JNB / JNC
         case 0x4: b.jz(lbl);  break; // JE / JZ
         case 0x5: b.jnz(lbl); break; // JNE / JNZ
         case 0x6: b.jbe(lbl); break; // JBE / JNA
         case 0x7: b.ja(lbl);  break; // JA / JNBE
+        case 0x8: b.js(lbl);  break; // JS
+        case 0x9: b.jns(lbl); break; // JNS
         case 0xC: b.jl(lbl);  break; // JL / JNGE
         case 0xD: b.jge(lbl); break; // JGE / JNL
         case 0xE: b.jle(lbl); break; // JLE / JNG
@@ -442,7 +654,8 @@ bool lift_x64_function(
     uint64_t         vm_seed,
     vm::VmProgram&   out_program,
     size_t*          out_native_size,
-    size_t*          out_decoded_insns
+    size_t*          out_decoded_insns,
+    uint32_t         fn_rva
 ) noexcept {
     if (!fn_bytes || max_scan_bytes < 16) return false;
 
@@ -514,32 +727,56 @@ bool lift_x64_function(
             } else if (op == 0xAF) {
                 // imul reg, r/m
                 const auto dst = static_cast<VmReg>(insn.reg);
-                const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0);
+                const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0, 0, fn_rva);
                 b.imul_reg(dst, src);
-                if (zext32) b.movzx32(dst, dst);
+                if (zext32) write_subreg_preserve_high(b, dst, dst, default_operand_bytes(insn));
             } else if (op == 0xB6) {
                 // movzx reg, r/m8
                 const auto dst = static_cast<VmReg>(insn.reg);
-                const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0);
+                const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0, 1, fn_rva);
                 b.mov_reg(dst, src)
                  .mov_imm(VTMP1, 0xFFULL)
                  .and_reg(dst, VTMP1);
             } else if (op == 0xB7) {
                 // movzx reg, r/m16
                 const auto dst = static_cast<VmReg>(insn.reg);
-                const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0);
+                const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0, 2, fn_rva);
                 b.mov_reg(dst, src)
                  .mov_imm(VTMP1, 0xFFFFULL)
                  .and_reg(dst, VTMP1);
+            } else if (op == 0xBE) {
+                // movsx reg, r/m8
+                const auto dst = static_cast<VmReg>(insn.reg);
+                const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0, 1, fn_rva);
+                b.mov_reg(dst, src)
+                 .shl_imm(dst, 56)
+                 .sar_imm(dst, 56);
+                if (zext32) write_subreg_preserve_high(b, dst, dst, default_operand_bytes(insn));
+            } else if (op == 0xBF) {
+                // movsx reg, r/m16
+                const auto dst = static_cast<VmReg>(insn.reg);
+                const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0, 2, fn_rva);
+                b.mov_reg(dst, src)
+                 .shl_imm(dst, 48)
+                 .sar_imm(dst, 48);
+                if (zext32) write_subreg_preserve_high(b, dst, dst, default_operand_bytes(insn));
             } else if (op >= 0x40 && op <= 0x4F) {
                 // cmovcc reg, r/m -> branch around mov_reg using inverted condition (cond ^ 1)
                 const auto dst = static_cast<VmReg>(insn.reg);
-                const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0);
+                const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0, 0, fn_rva);
                 const std::string skip_lbl = "CMOV_" + std::to_string(idx);
                 emit_jcc_by_code(b, (op & 0x0Fu) ^ 1u, skip_lbl);
                 b.mov_reg(dst, src);
                 b.label(skip_lbl);
                 if (zext32) b.movzx32(dst, dst);
+            } else if (op >= 0x90 && op <= 0x9F) {
+                // setcc r/m8
+                const std::string skip_lbl = "SETCC_" + std::to_string(idx);
+                b.mov_imm(VTMP1, 0);
+                emit_jcc_by_code(b, (op & 0x0Fu) ^ 1u, skip_lbl);
+                b.mov_imm(VTMP1, 1);
+                b.label(skip_lbl);
+                store_rm_operand(b, fn_bytes, insn, VTMP1, false, 1, fn_rva);
             }
             continue;
         }
@@ -547,6 +784,20 @@ bool lift_x64_function(
         const uint8_t op = insn.opcode;
         if (op == 0x90) {
             b.nop();
+        } else if (op == 0x98) {
+            // cdqe (sign-extend eax -> rax) or cwde (sign-extend ax -> eax)
+            if (insn.rex_w) {
+                b.shl_imm(R0, 32).sar_imm(R0, 32);
+            } else {
+                b.shl_imm(R0, 48).sar_imm(R0, 48).movzx32(R0, R0);
+            }
+        } else if (op == 0x99) {
+            // cqo (sign-extend rax -> rdx:rax) or cdq (sign-extend eax -> edx:eax)
+            if (insn.rex_w) {
+                b.mov_reg(R2, R0).sar_imm(R2, 63);
+            } else {
+                b.mov_reg(R2, R0).shl_imm(R2, 32).sar_imm(R2, 63).movzx32(R2, R2);
+            }
         } else if (op == 0xC3) {
             b.anti_debug_check()
              .ret();
@@ -556,124 +807,157 @@ bool lift_x64_function(
             b.pop(static_cast<VmReg>(insn.rm));
         } else if (op == 0xEB || op == 0xE9) {
             b.jmp("L_" + std::to_string(insn.branch_target));
+        } else if (op == 0xE8) {
+            // call rel32 -> if target is inside lifted function range, could be internal, otherwise external native call
+            if (fn_rva != 0) {
+                const uint64_t callee_rva = static_cast<uint64_t>(fn_rva + insn.offset + insn.length) +
+                                            static_cast<uint64_t>(insn.disp);
+                b.mov_imm(VTMP0, callee_rva)
+                 .add_image_base(VTMP0)
+                 .call_abs(VTMP0);
+            } else {
+                const uint64_t callee_va = reinterpret_cast<uint64_t>(fn_bytes + insn.offset + insn.length) +
+                                           static_cast<uint64_t>(insn.disp);
+                b.mov_imm(VTMP0, callee_va)
+                 .call_abs(VTMP0);
+            }
         } else if (op >= 0x70 && op <= 0x7F) {
             emit_jcc_by_code(b, insn.jcc_cond, "L_" + std::to_string(insn.branch_target));
+        } else if (op >= 0xB0 && op <= 0xB7) {
+            // mov r8, imm8 (supports AL..BL, SPL..DIL with REX, and AH..BH without REX)
+            b.mov_imm(VTMP1, insn.imm & 0xFFULL);
+            write_reg8_preserve(b, insn, insn.rm, VTMP1);
         } else if (op >= 0xB8 && op <= 0xBF) {
             b.mov_imm(static_cast<VmReg>(insn.rm), insn.imm);
+        } else if (op == 0x88) {
+            // mov r/m8, r8
+            load_reg8(b, insn, insn.reg, VTMP1);
+            store_rm_operand(b, fn_bytes, insn, VTMP1, false, 1, fn_rva);
         } else if (op == 0x89) {
             // mov r/m, reg
             const auto src = static_cast<VmReg>(insn.reg);
             if (insn.mod == 3u) {
                 const auto dst = static_cast<VmReg>(insn.rm);
-                b.mov_reg(dst, src);
-                if (zext32) b.movzx32(dst, dst);
+                write_subreg_preserve_high(b, dst, src, default_operand_bytes(insn));
             } else {
                 b.mov_reg(VTMP1, src);
-                store_rm_operand(b, fn_bytes, insn, VTMP1, zext32);
+                store_rm_operand(b, fn_bytes, insn, VTMP1, zext32, 0, fn_rva);
             }
+        } else if (op == 0x8A) {
+            // mov r8, r/m8
+            const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0, 1, fn_rva);
+            write_reg8_preserve(b, insn, insn.reg, src);
         } else if (op == 0x8B) {
             // mov reg, r/m
             const auto dst = static_cast<VmReg>(insn.reg);
-            const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0);
-            b.mov_reg(dst, src);
-            if (zext32) b.movzx32(dst, dst);
+            const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0, 0, fn_rva);
+            write_subreg_preserve_high(b, dst, src, default_operand_bytes(insn));
+        } else if (op == 0xC6) {
+            // mov r/m8, imm8
+            b.mov_imm(VTMP1, insn.imm & 0xFFULL);
+            store_rm_operand(b, fn_bytes, insn, VTMP1, false, 1, fn_rva);
         } else if (op == 0xC7) {
             // mov r/m, imm32
             b.mov_imm(VTMP1, insn.imm);
-            store_rm_operand(b, fn_bytes, insn, VTMP1, zext32);
+            store_rm_operand(b, fn_bytes, insn, VTMP1, zext32, 0, fn_rva);
         } else if (op == 0x63) {
             // movsxd r64, r/m32
             const auto dst = static_cast<VmReg>(insn.reg);
-            const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0);
+            const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0, 4, fn_rva);
             b.mov_reg(dst, src)
              .shl_imm(dst, 32)
              .sar_imm(dst, 32);
         } else if (op == 0x8D) {
             // lea reg, m -> decomposed into Non-Linear MBA address micro-ops
             const auto dst = static_cast<VmReg>(insn.reg);
-            emit_effective_address(b, fn_bytes, insn, VTMP0);
-            b.mov_reg(dst, VTMP0);
-            if (zext32) b.movzx32(dst, dst);
+            emit_effective_address(b, fn_bytes, insn, VTMP0, fn_rva);
+            write_subreg_preserve_high(b, dst, VTMP0, default_operand_bytes(insn));
         } else if (op == 0x01 || op == 0x03 || op == 0x29 || op == 0x2B ||
                    op == 0x31 || op == 0x33 || op == 0x21 || op == 0x23 ||
                    op == 0x09 || op == 0x0B) {
             const bool dir_rm_to_reg = (op & 0x02u) != 0;
             const uint8_t base_op    = static_cast<uint8_t>(op & ~0x03u);
             const auto reg_op        = static_cast<VmReg>(insn.reg);
+            const uint8_t w_bytes    = default_operand_bytes(insn);
+            const uint8_t alu_kind   = (base_op == 0x00) ? 0u
+                                     : (base_op == 0x28) ? 5u
+                                     : (base_op == 0x30) ? 6u
+                                     : (base_op == 0x20) ? 4u : 1u;
 
             if (dir_rm_to_reg) {
-                const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0);
-                if (base_op == 0x00)      b.mba_add(reg_op, src);
-                else if (base_op == 0x28) b.mba_sub(reg_op, src);
-                else if (base_op == 0x30) b.mba_xor(reg_op, src);
-                else if (base_op == 0x20) b.and_reg(reg_op, src);
-                else if (base_op == 0x08) b.or_reg(reg_op, src);
-                if (zext32) b.movzx32(reg_op, reg_op);
+                const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0, 0, fn_rva);
+                emit_sized_alu_op(b, alu_kind, reg_op, src, w_bytes);
+                if (zext32) write_subreg_preserve_high(b, reg_op, reg_op, w_bytes);
             } else {
-                const VmReg cur = load_rm_operand(b, fn_bytes, insn, VTMP1);
-                if (base_op == 0x00)      b.mba_add(cur, reg_op);
-                else if (base_op == 0x28) b.mba_sub(cur, reg_op);
-                else if (base_op == 0x30) b.mba_xor(cur, reg_op);
-                else if (base_op == 0x20) b.and_reg(cur, reg_op);
-                else if (base_op == 0x08) b.or_reg(cur, reg_op);
-                store_rm_operand(b, fn_bytes, insn, cur, zext32);
+                const VmReg cur = load_rm_operand(b, fn_bytes, insn, VTMP1, 0, fn_rva);
+                emit_sized_alu_op(b, alu_kind, cur, reg_op, w_bytes);
+                store_rm_operand(b, fn_bytes, insn, cur, zext32, 0, fn_rva);
             }
         } else if (op == 0x39 || op == 0x3B) {
             // cmp r/m, reg (39) or cmp reg, r/m (3B)
-            VmReg lhs = (op == 0x39) ? load_rm_operand(b, fn_bytes, insn, VTMP0)
+            VmReg lhs = (op == 0x39) ? load_rm_operand(b, fn_bytes, insn, VTMP0, 0, fn_rva)
                                      : static_cast<VmReg>(insn.reg);
             VmReg rhs = (op == 0x39) ? static_cast<VmReg>(insn.reg)
-                                     : load_rm_operand(b, fn_bytes, insn, VTMP0);
+                                     : load_rm_operand(b, fn_bytes, insn, VTMP0, 0, fn_rva);
             if (zext32) {
-                b.mov_reg(VTMP0, lhs).shl_imm(VTMP0, 32).sar_imm(VTMP0, 32);
-                b.mov_reg(VTMP1, rhs).shl_imm(VTMP1, 32).sar_imm(VTMP1, 32);
+                const uint8_t sh = insn.has_66 ? 48u : 32u;
+                b.mov_reg(VTMP0, lhs).shl_imm(VTMP0, sh);
+                b.mov_reg(VTMP1, rhs).shl_imm(VTMP1, sh);
                 b.cmp_reg(VTMP0, VTMP1);
             } else {
                 b.cmp_reg(lhs, rhs);
             }
         } else if (op == 0x85 || op == 0x84) {
             // test r/m, reg
-            const VmReg lhs = load_rm_operand(b, fn_bytes, insn, VTMP0);
-            const auto  rhs = static_cast<VmReg>(insn.reg);
-            b.mov_reg(VTMP1, lhs)
-             .and_reg(VTMP1, rhs);
+            const uint8_t w = (op == 0x84) ? 1u : 0u;
+            const VmReg lhs = load_rm_operand(b, fn_bytes, insn, VTMP0, w, fn_rva);
             if (op == 0x84) {
-                b.mov_imm(VTMP0, 0xFFULL).and_reg(VTMP1, VTMP0);
-            } else if (zext32) {
-                b.shl_imm(VTMP1, 32).sar_imm(VTMP1, 32);
+                if (lhs != VTMP0) b.mov_reg(VTMP0, lhs);
+                load_reg8(b, insn, insn.reg, VTMP1);
+                b.and_reg(VTMP1, VTMP0)
+                 .shl_imm(VTMP1, 56)
+                 .sar_imm(VTMP1, 56);
+            } else {
+                const auto rhs = static_cast<VmReg>(insn.reg);
+                b.mov_reg(VTMP1, lhs)
+                 .and_reg(VTMP1, rhs);
+                if (zext32) {
+                    const uint8_t sh = insn.has_66 ? 48u : 32u;
+                    b.shl_imm(VTMP1, sh).sar_imm(VTMP1, sh);
+                }
             }
             b.cmp_imm(VTMP1, 0);
-        } else if (op == 0x81 || op == 0x83) {
+        } else if (op == 0x80 || op == 0x81 || op == 0x83) {
             // ALU Group 1 with immediate: /0=ADD, /1=OR, /4=AND, /5=SUB, /6=XOR, /7=CMP
-            const uint8_t subop = insn.reg & 7u;
-            const VmReg   cur   = load_rm_operand(b, fn_bytes, insn, VTMP1);
+            const uint8_t subop   = insn.reg & 7u;
+            const uint8_t w       = (op == 0x80) ? 1u : 0u;
+            const uint8_t w_bytes = (op == 0x80) ? 1u : default_operand_bytes(insn);
+            const VmReg   cur     = load_rm_operand(b, fn_bytes, insn, VTMP1, w, fn_rva);
             if (subop == 7u) {
-                if (zext32) {
-                    const uint64_t sext_imm = static_cast<uint64_t>(
-                        static_cast<int64_t>(static_cast<int32_t>(insn.imm))
-                    );
-                    b.mov_reg(VTMP0, cur).shl_imm(VTMP0, 32).sar_imm(VTMP0, 32);
-                    b.cmp_imm(VTMP0, sext_imm);
+                if (op == 0x80) {
+                    const uint64_t sh_imm8 = (insn.imm & 0xFFULL) << 56;
+                    b.mov_reg(VTMP0, cur).shl_imm(VTMP0, 56);
+                    b.cmp_imm(VTMP0, sh_imm8);
+                } else if (zext32) {
+                    const uint8_t sh = insn.has_66 ? 48u : 32u;
+                    const uint64_t sh_imm = insn.imm << sh;
+                    b.mov_reg(VTMP0, cur).shl_imm(VTMP0, sh);
+                    b.cmp_imm(VTMP0, sh_imm);
                 } else {
                     b.cmp_imm(cur, insn.imm);
                 }
             } else {
                 b.mov_imm(VTMP0, insn.imm);
-                if (subop == 0u)      b.mba_add(cur, VTMP0);
-                else if (subop == 1u) b.or_reg(cur, VTMP0);
-                else if (subop == 4u) b.and_reg(cur, VTMP0);
-                else if (subop == 5u) b.mba_sub(cur, VTMP0);
-                else if (subop == 6u) b.mba_xor(cur, VTMP0);
-                store_rm_operand(b, fn_bytes, insn, cur, zext32);
+                emit_sized_alu_op(b, subop, cur, VTMP0, w_bytes);
+                store_rm_operand(b, fn_bytes, insn, cur, zext32, w, fn_rva);
             }
         } else if (op == 0x05 || op == 0x0D || op == 0x25 || op == 0x2D || op == 0x35 || op == 0x3D || op == 0xA9 || op == 0xA8) {
             if (op == 0x3D) {
                 if (zext32) {
-                    const uint64_t sext_imm = static_cast<uint64_t>(
-                        static_cast<int64_t>(static_cast<int32_t>(insn.imm))
-                    );
-                    b.mov_reg(VTMP0, R0).shl_imm(VTMP0, 32).sar_imm(VTMP0, 32);
-                    b.cmp_imm(VTMP0, sext_imm);
+                    const uint8_t sh = insn.has_66 ? 48u : 32u;
+                    const uint64_t sh_imm = insn.imm << sh;
+                    b.mov_reg(VTMP0, R0).shl_imm(VTMP0, sh);
+                    b.cmp_imm(VTMP0, sh_imm);
                 } else {
                     b.cmp_imm(R0, insn.imm);
                 }
@@ -681,36 +965,44 @@ bool lift_x64_function(
                 b.mov_reg(VTMP1, R0)
                  .mov_imm(VTMP0, insn.imm)
                  .and_reg(VTMP1, VTMP0);
-                if (zext32 && op == 0xA9) {
-                    b.shl_imm(VTMP1, 32).sar_imm(VTMP1, 32);
+                if (op == 0xA8) {
+                    b.shl_imm(VTMP1, 56).sar_imm(VTMP1, 56);
+                } else if (zext32) {
+                    const uint8_t sh = insn.has_66 ? 48u : 32u;
+                    b.shl_imm(VTMP1, sh).sar_imm(VTMP1, sh);
                 }
                 b.cmp_imm(VTMP1, 0);
             } else {
+                const uint8_t w_bytes  = default_operand_bytes(insn);
+                const uint8_t alu_kind = (op == 0x05) ? 0u
+                                       : (op == 0x0D) ? 1u
+                                       : (op == 0x25) ? 4u
+                                       : (op == 0x2D) ? 5u : 6u;
                 b.mov_imm(VTMP0, insn.imm);
-                if (op == 0x05)      b.mba_add(R0, VTMP0);
-                else if (op == 0x0D) b.or_reg(R0, VTMP0);
-                else if (op == 0x25) b.and_reg(R0, VTMP0);
-                else if (op == 0x2D) b.mba_sub(R0, VTMP0);
-                else if (op == 0x35) b.mba_xor(R0, VTMP0);
-                if (zext32) b.movzx32(R0, R0);
+                emit_sized_alu_op(b, alu_kind, R0, VTMP0, w_bytes);
+                if (zext32) write_subreg_preserve_high(b, R0, R0, w_bytes);
             }
         } else if (op == 0x69 || op == 0x6B) {
             // imul reg, r/m, imm
             const auto dst = static_cast<VmReg>(insn.reg);
-            const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0);
+            const VmReg src = load_rm_operand(b, fn_bytes, insn, VTMP0, 0, fn_rva);
             b.mov_reg(dst, src)
              .mov_imm(VTMP1, insn.imm)
              .imul_reg(dst, VTMP1);
             if (zext32) b.movzx32(dst, dst);
-        } else if (op == 0xC1 || op == 0xD1 || op == 0xD3) {
+        } else if (op == 0xC0 || op == 0xC1 || op == 0xD1 || op == 0xD3) {
             // Shifts & Rotates: /0=ROL, /1=ROR, /4=SHL, /5=SHR, /7=SAR
             const uint8_t subop = insn.reg & 7u;
-            const VmReg   cur   = load_rm_operand(b, fn_bytes, insn, VTMP1);
+            const uint8_t w     = (op == 0xC0) ? 1u : 0u;
+            const VmReg   cur   = load_rm_operand(b, fn_bytes, insn, VTMP1, w, fn_rva);
             if (op == 0xD3) {
                 if (subop == 4u)      b.shl_reg(cur, R1);
                 else if (subop == 5u) {
                     if (zext32) b.movzx32(cur, cur);
                     b.shr_reg(cur, R1);
+                } else if (subop == 7u) {
+                    if (zext32) b.shl_imm(cur, 32).sar_imm(cur, 32);
+                    b.sar_reg(cur, R1);
                 }
             } else {
                 const uint8_t sh = (op == 0xD1) ? 1u : static_cast<uint8_t>(insn.imm & 63u);
@@ -728,10 +1020,11 @@ bool lift_x64_function(
                     }
                 }
             }
-            store_rm_operand(b, fn_bytes, insn, cur, zext32);
+            store_rm_operand(b, fn_bytes, insn, cur, zext32, w, fn_rva);
         } else if (op == 0xF6 || op == 0xF7) {
             const uint8_t subop = insn.reg & 7u;
-            const VmReg   cur   = load_rm_operand(b, fn_bytes, insn, VTMP1);
+            const uint8_t w     = (op == 0xF6) ? 1u : 0u;
+            const VmReg   cur   = load_rm_operand(b, fn_bytes, insn, VTMP1, w, fn_rva);
             if (subop == 0u || subop == 1u) {
                 b.mov_reg(VTMP1, cur)
                  .mov_imm(VTMP0, insn.imm)
@@ -742,21 +1035,30 @@ bool lift_x64_function(
                 b.cmp_imm(VTMP1, 0);
             } else if (subop == 2u) {
                 b.not_reg(cur);
-                store_rm_operand(b, fn_bytes, insn, cur, zext32);
+                store_rm_operand(b, fn_bytes, insn, cur, zext32, w, fn_rva);
             } else if (subop == 3u) {
                 b.neg_reg(cur);
-                store_rm_operand(b, fn_bytes, insn, cur, zext32);
+                store_rm_operand(b, fn_bytes, insn, cur, zext32, w, fn_rva);
             } else if (subop == 4u || subop == 5u) {
                 b.imul_reg(R0, cur);
                 if (zext32) b.movzx32(R0, R0);
             }
-        } else if (op == 0xFF) {
-            const uint8_t subop = insn.reg & 7u;
-            const VmReg   cur   = load_rm_operand(b, fn_bytes, insn, VTMP1);
-            b.mov_imm(VTMP0, 1ULL);
-            if (subop == 0u)      b.mba_add(cur, VTMP0);
-            else if (subop == 1u) b.mba_sub(cur, VTMP0);
-            store_rm_operand(b, fn_bytes, insn, cur, zext32);
+        } else if (op == 0xFE || op == 0xFF) {
+            const uint8_t subop   = insn.reg & 7u;
+            const uint8_t w       = (op == 0xFE) ? 1u : 0u;
+            const uint8_t w_bytes = (op == 0xFE) ? 1u : default_operand_bytes(insn);
+            const VmReg   cur     = load_rm_operand(b, fn_bytes, insn, VTMP1, w, fn_rva);
+            if (subop == 0u || subop == 1u) {
+                b.mov_imm(VTMP0, 1ULL);
+                emit_sized_alu_op(b, (subop == 0u) ? 0u : 5u, cur, VTMP0, w_bytes);
+                store_rm_operand(b, fn_bytes, insn, cur, zext32, w, fn_rva);
+            } else if (op == 0xFF && subop == 2u) {
+                // call r/m64
+                b.call_abs(cur);
+            } else if (op == 0xFF && subop == 6u) {
+                // push r/m64
+                b.push(cur);
+            }
         }
     }
 
@@ -810,24 +1112,17 @@ LiftReport virtualize_and_shred(
     size_t decoded_insns = 0;
 
     // Phase 1: Unlock .vcode as RX via JitSectionGuard, decode & lift x86_64 instructions,
-    // and verify mathematical equivalence between native_fn and the lifted VmProgram!
+    // and verify ciphertext integrity without speculative dummy-pointer execution!
     {
         antidump::JitSectionGuard rx_guard;
         if (!lift_x64_function(target_fn, max_scan_bytes, custom_seed, prog, &native_size, &decoded_insns) ||
-            native_size < 14) {
+            native_size < 14 || prog.bytecode.empty()) {
             return rep;
         }
-
-        using GenericX64Fn = uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t);
-        auto native_fn = reinterpret_cast<GenericX64Fn>(target_fn);
-        const uint64_t expected_out = native_fn(0x1001A5A5ULL, 0x9988776655443322ULL, 0ULL, 0ULL);
-
-        vm::VmEngine test_engine;
-        bool vm_ok = false;
-        const uint64_t lifted_out = test_engine.run_x64_abi(
-            prog, 0x1001A5A5ULL, 0x9988776655443322ULL, 0ULL, 0ULL, &vm_ok
+        const uint64_t expected_tag = vm::compute_ciphertext_tag(
+            prog.bytecode.data(), prog.bytecode.size(), prog.seed
         );
-        if (!vm_ok || lifted_out != expected_out) {
+        if (expected_tag != prog.integrity_tag) {
             return rep;
         }
     }
@@ -879,6 +1174,9 @@ LiftReport virtualize_and_shred(
             DWORD dummy = 0;
             fn_vp(target_fn, native_size, old_prot, &dummy);
             FlushInstructionCache(GetCurrentProcess(), target_fn, native_size);
+            if (shredded && vault::active()) {
+                vault::sync_modified_range(target_fn, native_size);
+            }
         }
     }
 
@@ -918,7 +1216,7 @@ LiftReport activate_aot_or_runtime_slot(AotVirtualSlotRaw* raw_slot) noexcept {
         prog.bytecode.resize(raw_slot->bytecode_size);
 
         for (uint32_t i = 0; i < raw_slot->bytecode_size; ++i) {
-            const uint8_t mask = static_cast<uint8_t>(((raw_slot->vm_seed >> ((i & 7u) * 8u)) & 0xFFu) ^ 0xA5u);
+            const uint8_t mask = crypto::poly_stream_byte(raw_slot->vm_seed, i);
             prog.bytecode[i]   = static_cast<uint8_t>(raw_slot->bytecode[i] ^ mask);
         }
 
@@ -944,7 +1242,12 @@ LiftReport activate_aot_or_runtime_slot(AotVirtualSlotRaw* raw_slot) noexcept {
     }
 
     // Fallback for unpacked dev binary: lift and shred at runtime
-    return virtualize_and_shred(reinterpret_cast<void*>(raw_slot->target_fn_va));
+    LiftReport rep = virtualize_and_shred(reinterpret_cast<void*>(raw_slot->target_fn_va));
+    if (rep.success) {
+        raw_slot->slot_id    = rep.slot_id;
+        raw_slot->pre_lifted = 2;
+    }
+    return rep;
 }
 
 bool is_function_virtualized(const void* fn_address, LiftReport* out_report) noexcept {

@@ -10,7 +10,8 @@ namespace vpack::virtualizer {
 
 using ThunkFnPtr = uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t) noexcept;
 
-constexpr uint64_t kAotSlotMagic = 0x9F81E3A5C72B4D19ULL;
+constexpr size_t   kMaxVirtualizedSlots = 16;
+constexpr uint64_t kAotSlotMagic        = 0x9F81E3A5C72B4D19ULL;
 
 struct LiftReport {
     bool     success           = false;
@@ -36,7 +37,7 @@ struct AotVirtualSlotRaw {
     uint64_t integrity_tag;
     uint32_t native_code_size;
     uint32_t decoded_insns;
-    uint8_t  bytecode[512];
+    uint8_t  bytecode[2048];
 };
 
 template <typename TargetFnT>
@@ -51,11 +52,11 @@ struct AotVirtualSlotT {
     uint64_t   integrity_tag;
     uint32_t   native_code_size;
     uint32_t   decoded_insns;
-    uint8_t    bytecode[512];
+    uint8_t    bytecode[2048];
 };
 #pragma pack(pop)
 
-static_assert(sizeof(AotVirtualSlotRaw) == 568, "AotVirtualSlotRaw size mismatch");
+static_assert(sizeof(AotVirtualSlotRaw) == 2104, "AotVirtualSlotRaw size mismatch");
 
 // Decodes a compiled x86_64 function starting at `fn_bytes`, fragments its instructions
 // into Non-Linear MBA & Hybrid VM micro-operations, and produces a rolling-encrypted VmProgram.
@@ -65,7 +66,8 @@ bool lift_x64_function(
     uint64_t         vm_seed,
     vm::VmProgram&   out_program,
     size_t*          out_native_size = nullptr,
-    size_t*          out_decoded_insns = nullptr
+    size_t*          out_decoded_insns = nullptr,
+    uint32_t         fn_rva = 0
 ) noexcept;
 
 // Lifts a compiled x86_64 function into the Polymorphic Hybrid VM, verifies mathematical
@@ -100,17 +102,20 @@ uint64_t vm_slot_thunk(uint64_t rcx_arg, uint64_t rdx_arg, uint64_t r8_arg, uint
 
 } // namespace vpack::virtualizer
 
-#define VPACK_VIRTUALIZE_FN(FnPtr) \
+#define VPACK_VIRTUALIZE_FN_SLOT(FnPtr, CounterVal) \
     ([]() noexcept -> ::vpack::virtualizer::LiftReport { \
         using FnT = decltype(FnPtr); \
+        constexpr uint16_t kSlotId = static_cast<uint16_t>((CounterVal) % ::vpack::virtualizer::kMaxVirtualizedSlots); \
         alignas(8) static ::vpack::virtualizer::AotVirtualSlotT<FnT> s_aot_slot = { \
             ::vpack::virtualizer::kAotSlotMagic, \
-            0, 0, 0, \
+            kSlotId, 0, 0, \
             (FnPtr), \
-            &::vpack::virtualizer::vm_slot_thunk<0>, \
+            &::vpack::virtualizer::vm_slot_thunk<kSlotId>, \
             0, 0, 0, 0, {} \
         }; \
         return ::vpack::virtualizer::activate_aot_or_runtime_slot( \
             reinterpret_cast<::vpack::virtualizer::AotVirtualSlotRaw*>(&s_aot_slot) \
         ); \
     }())
+
+#define VPACK_VIRTUALIZE_FN(FnPtr) VPACK_VIRTUALIZE_FN_SLOT(FnPtr, __COUNTER__)

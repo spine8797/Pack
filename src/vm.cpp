@@ -41,8 +41,27 @@ VPACK_FORCEINLINE void update_cmp_flags(VmContext& ctx, uint64_t lhs, uint64_t r
     }
 }
 
+VPACK_FORCEINLINE void update_add_flags(VmContext& ctx, uint64_t lhs, uint64_t rhs, uint64_t res) noexcept {
+    ctx.flags &= ~(FLAG_ZF | FLAG_SF | FLAG_CF | FLAG_OF);
+    if (res == 0) {
+        ctx.flags |= FLAG_ZF;
+    }
+    if ((res >> 63) & 1ULL) {
+        ctx.flags |= FLAG_SF;
+    }
+    if (res < lhs) {
+        ctx.flags |= FLAG_CF;
+    }
+    bool sign_lhs = ((lhs >> 63) & 1ULL) != 0;
+    bool sign_rhs = ((rhs >> 63) & 1ULL) != 0;
+    bool sign_res = ((res >> 63) & 1ULL) != 0;
+    if ((sign_lhs == sign_rhs) && (sign_lhs != sign_res)) {
+        ctx.flags |= FLAG_OF;
+    }
+}
+
 VPACK_FORCEINLINE void update_alu_flags(VmContext& ctx, uint64_t val) noexcept {
-    ctx.flags &= ~(FLAG_ZF | FLAG_SF);
+    ctx.flags &= ~(FLAG_ZF | FLAG_SF | FLAG_CF | FLAG_OF);
     if (val == 0) ctx.flags |= FLAG_ZF;
     if ((val >> 63) & 1ULL) ctx.flags |= FLAG_SF;
 }
@@ -163,32 +182,40 @@ VPACK_CODE bool h_mov_reg(VmExecState& s) noexcept {
 VPACK_CODE bool h_add_reg(VmExecState& s) noexcept {
     uint8_t dst = 0, src = 0;
     if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
-    s.ctx.vreg(dst) = crypto::mba_add(s.ctx.vreg(dst), s.ctx.vreg(src));
-    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    const uint64_t lhs = s.ctx.vreg(dst);
+    const uint64_t rhs = s.ctx.vreg(src);
+    const uint64_t res = crypto::mba_add(lhs, rhs);
+    s.ctx.vreg(dst)    = res;
+    update_add_flags(s.ctx, lhs, rhs, res);
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_add_imm(VmExecState& s) noexcept {
     uint8_t dst = 0; uint64_t imm = 0;
     if (!s.read_u8(dst) || !s.read_u64(imm) || dst >= REG_COUNT) return false;
-    s.ctx.vreg(dst) = crypto::mba_add(s.ctx.vreg(dst), imm);
-    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    const uint64_t lhs = s.ctx.vreg(dst);
+    const uint64_t res = crypto::mba_add(lhs, imm);
+    s.ctx.vreg(dst)    = res;
+    update_add_flags(s.ctx, lhs, imm, res);
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_sub_reg(VmExecState& s) noexcept {
     uint8_t dst = 0, src = 0;
     if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
-    s.ctx.vreg(dst) = crypto::mba_sub(s.ctx.vreg(dst), s.ctx.vreg(src));
-    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    const uint64_t lhs = s.ctx.vreg(dst);
+    const uint64_t rhs = s.ctx.vreg(src);
+    update_cmp_flags(s.ctx, lhs, rhs);
+    s.ctx.vreg(dst) = crypto::mba_sub(lhs, rhs);
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_sub_imm(VmExecState& s) noexcept {
     uint8_t dst = 0; uint64_t imm = 0;
     if (!s.read_u8(dst) || !s.read_u64(imm) || dst >= REG_COUNT) return false;
-    s.ctx.vreg(dst) = crypto::mba_sub(s.ctx.vreg(dst), imm);
-    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    const uint64_t lhs = s.ctx.vreg(dst);
+    update_cmp_flags(s.ctx, lhs, imm);
+    s.ctx.vreg(dst) = crypto::mba_sub(lhs, imm);
     return dispatch_next(s);
 }
 
@@ -277,8 +304,9 @@ VPACK_CODE bool h_not_reg(VmExecState& s) noexcept {
 VPACK_CODE bool h_neg_reg(VmExecState& s) noexcept {
     uint8_t dst = 0;
     if (!s.read_u8(dst) || dst >= REG_COUNT) return false;
-    s.ctx.vreg(dst) = static_cast<uint64_t>(-static_cast<int64_t>(s.ctx.vreg(dst)));
-    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    const uint64_t rhs = s.ctx.vreg(dst);
+    update_cmp_flags(s.ctx, 0ULL, rhs);
+    s.ctx.vreg(dst) = static_cast<uint64_t>(-static_cast<int64_t>(rhs));
     return dispatch_next(s);
 }
 
@@ -420,16 +448,21 @@ VPACK_CODE bool h_sync_state(VmExecState& s) noexcept {
 VPACK_CODE bool h_mba_add(VmExecState& s) noexcept {
     uint8_t dst = 0, src = 0;
     if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
-    s.ctx.vreg(dst) = crypto::mba_add(s.ctx.vreg(dst), s.ctx.vreg(src));
-    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    const uint64_t lhs = s.ctx.vreg(dst);
+    const uint64_t rhs = s.ctx.vreg(src);
+    const uint64_t res = crypto::mba_add(lhs, rhs);
+    s.ctx.vreg(dst)    = res;
+    update_add_flags(s.ctx, lhs, rhs, res);
     return dispatch_next(s);
 }
 
 VPACK_CODE bool h_mba_sub(VmExecState& s) noexcept {
     uint8_t dst = 0, src = 0;
     if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
-    s.ctx.vreg(dst) = crypto::mba_sub(s.ctx.vreg(dst), s.ctx.vreg(src));
-    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    const uint64_t lhs = s.ctx.vreg(dst);
+    const uint64_t rhs = s.ctx.vreg(src);
+    update_cmp_flags(s.ctx, lhs, rhs);
+    s.ctx.vreg(dst) = crypto::mba_sub(lhs, rhs);
     return dispatch_next(s);
 }
 
@@ -600,6 +633,183 @@ VPACK_CODE bool h_ret(VmExecState& s) noexcept {
     return !s.ctx.tampered;
 }
 
+VPACK_CODE bool h_load8(VmExecState& s) noexcept {
+    uint8_t dst = 0, addr_reg = 0;
+    if (!s.read_u8(dst) || !s.read_u8(addr_reg) || dst >= REG_COUNT || addr_reg >= REG_COUNT) return false;
+    const auto* ptr = reinterpret_cast<const uint8_t*>(s.ctx.vreg(addr_reg));
+    if (!ptr) return false;
+    s.ctx.vreg(dst) = static_cast<uint64_t>(*ptr);
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_load16(VmExecState& s) noexcept {
+    uint8_t dst = 0, addr_reg = 0;
+    if (!s.read_u8(dst) || !s.read_u8(addr_reg) || dst >= REG_COUNT || addr_reg >= REG_COUNT) return false;
+    const auto* ptr = reinterpret_cast<const uint16_t*>(s.ctx.vreg(addr_reg));
+    if (!ptr) return false;
+    uint16_t val = 0;
+    std::memcpy(&val, ptr, sizeof(uint16_t));
+    s.ctx.vreg(dst) = static_cast<uint64_t>(val);
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_load32(VmExecState& s) noexcept {
+    uint8_t dst = 0, addr_reg = 0;
+    if (!s.read_u8(dst) || !s.read_u8(addr_reg) || dst >= REG_COUNT || addr_reg >= REG_COUNT) return false;
+    const auto* ptr = reinterpret_cast<const uint32_t*>(s.ctx.vreg(addr_reg));
+    if (!ptr) return false;
+    uint32_t val = 0;
+    std::memcpy(&val, ptr, sizeof(uint32_t));
+    s.ctx.vreg(dst) = static_cast<uint64_t>(val);
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_store8(VmExecState& s) noexcept {
+    uint8_t addr_reg = 0, src = 0;
+    if (!s.read_u8(addr_reg) || !s.read_u8(src) || addr_reg >= REG_COUNT || src >= REG_COUNT) return false;
+    auto* ptr = reinterpret_cast<uint8_t*>(s.ctx.vreg(addr_reg));
+    if (!ptr) return false;
+    *ptr = static_cast<uint8_t>(s.ctx.vreg(src) & 0xFFu);
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_store16(VmExecState& s) noexcept {
+    uint8_t addr_reg = 0, src = 0;
+    if (!s.read_u8(addr_reg) || !s.read_u8(src) || addr_reg >= REG_COUNT || src >= REG_COUNT) return false;
+    auto* ptr = reinterpret_cast<uint16_t*>(s.ctx.vreg(addr_reg));
+    if (!ptr) return false;
+    uint16_t val = static_cast<uint16_t>(s.ctx.vreg(src) & 0xFFFFu);
+    std::memcpy(ptr, &val, sizeof(uint16_t));
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_store32(VmExecState& s) noexcept {
+    uint8_t addr_reg = 0, src = 0;
+    if (!s.read_u8(addr_reg) || !s.read_u8(src) || addr_reg >= REG_COUNT || src >= REG_COUNT) return false;
+    auto* ptr = reinterpret_cast<uint32_t*>(s.ctx.vreg(addr_reg));
+    if (!ptr) return false;
+    uint32_t val = static_cast<uint32_t>(s.ctx.vreg(src) & 0xFFFFFFFFu);
+    std::memcpy(ptr, &val, sizeof(uint32_t));
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_sar_reg(VmExecState& s) noexcept {
+    uint8_t dst = 0, src = 0;
+    if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
+    const uint8_t sh = static_cast<uint8_t>(s.ctx.vreg(src) & 63ULL);
+    s.ctx.vreg(dst) = static_cast<uint64_t>(static_cast<int64_t>(s.ctx.vreg(dst)) >> sh);
+    update_alu_flags(s.ctx, s.ctx.vreg(dst));
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_js(VmExecState& s) noexcept {
+    uint32_t target = 0;
+    if (!s.read_u32(target) || target >= s.code_size) return false;
+    if (s.ctx.flags & FLAG_SF) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_jns(VmExecState& s) noexcept {
+    uint32_t target = 0;
+    if (!s.read_u32(target) || target >= s.code_size) return false;
+    if (!(s.ctx.flags & FLAG_SF)) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_jo(VmExecState& s) noexcept {
+    uint32_t target = 0;
+    if (!s.read_u32(target) || target >= s.code_size) return false;
+    if (s.ctx.flags & FLAG_OF) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_jno(VmExecState& s) noexcept {
+    uint32_t target = 0;
+    if (!s.read_u32(target) || target >= s.code_size) return false;
+    if (!(s.ctx.flags & FLAG_OF)) {
+        s.ctx.ip            = target;
+        s.ctx.rolling_state = sync_rolling_state(s.seed, target) ^ s.ctx.env_poison;
+    }
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_add_image_base(VmExecState& s) noexcept {
+    uint8_t dst = 0;
+    if (!s.read_u8(dst) || dst >= REG_COUNT) return false;
+#if defined(_M_X64) || defined(__x86_64__)
+    const auto* peb = reinterpret_cast<const uint8_t*>(__readgsqword(0x60));
+    const uint64_t img_base = peb ? *reinterpret_cast<const uint64_t*>(peb + 0x10) : 0ULL;
+#else
+    const uint64_t img_base = 0ULL;
+#endif
+    s.ctx.vreg(dst) = crypto::mba_add(s.ctx.vreg(dst), img_base);
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_call_abs(VmExecState& s) noexcept {
+    uint8_t target_reg = 0;
+    if (!s.read_u8(target_reg) || target_reg >= REG_COUNT) return false;
+    const uintptr_t target_va = static_cast<uintptr_t>(s.ctx.vreg(target_reg));
+    if (target_va == 0) return false;
+
+    uint64_t arg5 = 0;
+    uint64_t arg6 = 0;
+    const uintptr_t sp = static_cast<uintptr_t>(s.ctx.vreg(R4));
+    const uintptr_t frame_start = reinterpret_cast<uintptr_t>(s.ctx.scratch_frame.data());
+    const uintptr_t frame_end   = frame_start + s.ctx.scratch_frame.size();
+    if (sp >= frame_start && sp + 0x30 <= frame_end) {
+        std::memcpy(&arg5, reinterpret_cast<const void*>(sp + 0x20), sizeof(uint64_t));
+        std::memcpy(&arg6, reinterpret_cast<const void*>(sp + 0x28), sizeof(uint64_t));
+    }
+
+    using FnNative6 = uint64_t(*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+    auto fn = reinterpret_cast<FnNative6>(reinterpret_cast<void*>(target_va));
+    s.ctx.vreg(R0) = fn(
+        s.ctx.vreg(R1),
+        s.ctx.vreg(R2),
+        s.ctx.vreg(R8),
+        s.ctx.vreg(R9),
+        arg5,
+        arg6
+    );
+    return dispatch_next(s);
+}
+
+// Flagless effective-address MBA addition (does NOT modify ctx.flags)
+VPACK_CODE bool h_lea_add(VmExecState& s) noexcept {
+    uint8_t dst = 0, src = 0;
+    if (!s.read_u8(dst) || !s.read_u8(src) || dst >= REG_COUNT || src >= REG_COUNT) return false;
+    s.ctx.vreg(dst) = crypto::mba_add(s.ctx.vreg(dst), s.ctx.vreg(src));
+    return dispatch_next(s);
+}
+
+// Flagless effective-address scale shift (does NOT modify ctx.flags)
+VPACK_CODE bool h_lea_shl(VmExecState& s) noexcept {
+    uint8_t dst = 0, shift = 0;
+    if (!s.read_u8(dst) || !s.read_u8(shift) || dst >= REG_COUNT) return false;
+    s.ctx.vreg(dst) <<= (shift & 63u);
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_save_flags(VmExecState& s) noexcept {
+    s.ctx.saved_flags = s.ctx.flags;
+    return dispatch_next(s);
+}
+
+VPACK_CODE bool h_restore_flags(VmExecState& s) noexcept {
+    s.ctx.flags = s.ctx.saved_flags;
+    return dispatch_next(s);
+}
+
 } // namespace
 
 BytecodeBuilder::BytecodeBuilder(uint64_t seed)
@@ -753,6 +963,13 @@ BytecodeBuilder& BytecodeBuilder::shr_reg(VmReg dst, VmReg shift_reg) {
     return *this;
 }
 
+BytecodeBuilder& BytecodeBuilder::sar_reg(VmReg dst, VmReg shift_reg) {
+    emit_op(OP_SAR_REG);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(static_cast<uint8_t>(shift_reg));
+    return *this;
+}
+
 BytecodeBuilder& BytecodeBuilder::rol_imm(VmReg dst, uint8_t shift) {
     emit_op(OP_ROL_IMM);
     emit_u8(static_cast<uint8_t>(dst));
@@ -863,6 +1080,26 @@ BytecodeBuilder& BytecodeBuilder::jbe(const std::string& target_label) {
     return *this;
 }
 
+BytecodeBuilder& BytecodeBuilder::js(const std::string& target_label) {
+    emit_branch(OP_JS, target_label);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::jns(const std::string& target_label) {
+    emit_branch(OP_JNS, target_label);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::jo(const std::string& target_label) {
+    emit_branch(OP_JO, target_label);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::jno(const std::string& target_label) {
+    emit_branch(OP_JNO, target_label);
+    return *this;
+}
+
 BytecodeBuilder& BytecodeBuilder::push(VmReg src) {
     emit_op(OP_PUSH_REG);
     emit_u8(static_cast<uint8_t>(src));
@@ -875,6 +1112,27 @@ BytecodeBuilder& BytecodeBuilder::pop(VmReg dst) {
     return *this;
 }
 
+BytecodeBuilder& BytecodeBuilder::load8(VmReg dst, VmReg addr_reg) {
+    emit_op(OP_LOAD8);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(static_cast<uint8_t>(addr_reg));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::load16(VmReg dst, VmReg addr_reg) {
+    emit_op(OP_LOAD16);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(static_cast<uint8_t>(addr_reg));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::load32(VmReg dst, VmReg addr_reg) {
+    emit_op(OP_LOAD32);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(static_cast<uint8_t>(addr_reg));
+    return *this;
+}
+
 BytecodeBuilder& BytecodeBuilder::load64(VmReg dst, VmReg addr_reg) {
     emit_op(OP_LOAD64);
     emit_u8(static_cast<uint8_t>(dst));
@@ -882,10 +1140,67 @@ BytecodeBuilder& BytecodeBuilder::load64(VmReg dst, VmReg addr_reg) {
     return *this;
 }
 
+BytecodeBuilder& BytecodeBuilder::store8(VmReg addr_reg, VmReg src) {
+    emit_op(OP_STORE8);
+    emit_u8(static_cast<uint8_t>(addr_reg));
+    emit_u8(static_cast<uint8_t>(src));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::store16(VmReg addr_reg, VmReg src) {
+    emit_op(OP_STORE16);
+    emit_u8(static_cast<uint8_t>(addr_reg));
+    emit_u8(static_cast<uint8_t>(src));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::store32(VmReg addr_reg, VmReg src) {
+    emit_op(OP_STORE32);
+    emit_u8(static_cast<uint8_t>(addr_reg));
+    emit_u8(static_cast<uint8_t>(src));
+    return *this;
+}
+
 BytecodeBuilder& BytecodeBuilder::store64(VmReg addr_reg, VmReg src) {
     emit_op(OP_STORE64);
     emit_u8(static_cast<uint8_t>(addr_reg));
     emit_u8(static_cast<uint8_t>(src));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::add_image_base(VmReg dst) {
+    emit_op(OP_ADD_IMAGE_BASE);
+    emit_u8(static_cast<uint8_t>(dst));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::call_abs(VmReg target_reg) {
+    emit_op(OP_CALL_ABS);
+    emit_u8(static_cast<uint8_t>(target_reg));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::lea_add(VmReg dst, VmReg src) {
+    emit_op(OP_LEA_ADD);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(static_cast<uint8_t>(src));
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::lea_shl(VmReg dst, uint8_t shift) {
+    emit_op(OP_LEA_SHL);
+    emit_u8(static_cast<uint8_t>(dst));
+    emit_u8(shift);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::save_flags() {
+    emit_op(OP_SAVE_FLAGS);
+    return *this;
+}
+
+BytecodeBuilder& BytecodeBuilder::restore_flags() {
+    emit_op(OP_RESTORE_FLAGS);
     return *this;
 }
 
@@ -1078,7 +1393,24 @@ VPACK_CODE bool execute_protected_vm(
         encode_handler_slot(&h_shr_reg,          runtime_ptr_mask, 46),
         encode_handler_slot(&h_sar_imm,          runtime_ptr_mask, 47),
         encode_handler_slot(&h_movzx32,          runtime_ptr_mask, 48),
-        encode_handler_slot(&h_ret,              runtime_ptr_mask, 49)
+        encode_handler_slot(&h_ret,              runtime_ptr_mask, 49),
+        encode_handler_slot(&h_load8,            runtime_ptr_mask, 50),
+        encode_handler_slot(&h_load16,           runtime_ptr_mask, 51),
+        encode_handler_slot(&h_load32,           runtime_ptr_mask, 52),
+        encode_handler_slot(&h_store8,           runtime_ptr_mask, 53),
+        encode_handler_slot(&h_store16,          runtime_ptr_mask, 54),
+        encode_handler_slot(&h_store32,          runtime_ptr_mask, 55),
+        encode_handler_slot(&h_sar_reg,          runtime_ptr_mask, 56),
+        encode_handler_slot(&h_js,               runtime_ptr_mask, 57),
+        encode_handler_slot(&h_jns,              runtime_ptr_mask, 58),
+        encode_handler_slot(&h_jo,               runtime_ptr_mask, 59),
+        encode_handler_slot(&h_jno,              runtime_ptr_mask, 60),
+        encode_handler_slot(&h_add_image_base,   runtime_ptr_mask, 61),
+        encode_handler_slot(&h_call_abs,         runtime_ptr_mask, 62),
+        encode_handler_slot(&h_lea_add,          runtime_ptr_mask, 63),
+        encode_handler_slot(&h_lea_shl,          runtime_ptr_mask, 64),
+        encode_handler_slot(&h_save_flags,       runtime_ptr_mask, 65),
+        encode_handler_slot(&h_restore_flags,    runtime_ptr_mask, 66)
     };
 
     for (uint8_t i = 0; i < REG_COUNT; ++i) {

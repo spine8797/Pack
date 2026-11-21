@@ -19,24 +19,28 @@ enum ThreatFlag : uint32_t {
     THREAT_TIMING_ANOMALY       = 1u << 6,
     THREAT_SOFTWARE_BREAKPOINT  = 1u << 7,
     THREAT_KERNEL_DEBUGGER      = 1u << 8,
-    THREAT_DLL_INJECTED         = 1u << 9,
-    THREAT_NTDLL_HOOKED         = 1u << 10,
-    THREAT_KUSER_DEBUGGER       = 1u << 11,
-    THREAT_VCODE_TAMPERED       = 1u << 12
+    THREAT_NTDLL_HOOKED         = 1u << 9,
+    THREAT_KUSER_DEBUGGER       = 1u << 10,
+    THREAT_VCODE_TAMPERED       = 1u << 11,
+    THREAT_VIRTUAL_MACHINE      = 1u << 12,
+    THREAT_HEAP_FLAGS           = 1u << 13,
+    THREAT_PARENT_DEBUGGER      = 1u << 14,
+    THREAT_THREAD_HIDE_BYPASS   = 1u << 15
 };
 
 struct DebugReport {
     uint32_t flags = THREAT_NONE;
     uint64_t rdtsc_delta = 0;
     uint32_t cleared_hwbp_count = 0;
-    void*    injected_module_base = nullptr;
-    char     injected_module_name[64]{};
 
     bool detected() const noexcept { return flags != THREAT_NONE; }
 };
 
 bool check_peb_being_debugged() noexcept;
 bool check_nt_global_flag() noexcept;
+bool check_heap_flags() noexcept;
+bool check_parent_debugger() noexcept;
+bool verify_thread_hidden() noexcept;
 uint32_t check_nt_query_debug() noexcept;
 bool check_kernel_debugger() noexcept;
 bool check_kuser_shared_data() noexcept;

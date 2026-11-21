@@ -25,30 +25,32 @@ struct SyscallEntry {
 
 bool query_module_layout(void* module_base, ModuleLayoutInfo& out_info) noexcept;
 
-bool erase_pe_headers(void* module_base = nullptr) noexcept;
+VPACK_INIT_CODE bool erase_pe_headers(void* module_base = nullptr, bool keep_skeleton = false) noexcept;
 
-bool tamper_peb_image_size(uint32_t fake_size_delta = 0x01000000u) noexcept;
+VPACK_INIT_CODE bool tamper_peb_image_size(uint32_t fake_size_delta = 0x01000000u) noexcept;
 
 uint64_t compute_text_integrity(void* module_base = nullptr) noexcept;
 bool verify_text_integrity(uint64_t expected_hash, void* module_base = nullptr) noexcept;
 
-uint32_t capture_module_baseline() noexcept;
-bool detect_injected_module(void** out_base = nullptr, char* out_name = nullptr, size_t max_len = 0) noexcept;
-
 void* resolve_export_by_hash(uint64_t module_hash_ci, uint64_t proc_hash_ci) noexcept;
 
-// Resolves SSN via HalosGate / Tartarus' Gate neighbor inspection and locates an
+// Resolves SSN via sorted Zw* address table + neighbor inspection and locates an
 // unhooked `syscall; ret` gadget inside ntdll.dll for Indirect Syscall execution.
 bool resolve_ntdll_syscall(uint64_t proc_hash_ci, SyscallEntry& out_entry) noexcept;
 
 long invoke_indirect_syscall(
     const SyscallEntry& entry,
-    uint64_t arg1 = 0,
-    uint64_t arg2 = 0,
-    uint64_t arg3 = 0,
-    uint64_t arg4 = 0,
-    uint64_t arg5 = 0,
-    uint64_t arg6 = 0
+    uint64_t arg1  = 0,
+    uint64_t arg2  = 0,
+    uint64_t arg3  = 0,
+    uint64_t arg4  = 0,
+    uint64_t arg5  = 0,
+    uint64_t arg6  = 0,
+    uint64_t arg7  = 0,
+    uint64_t arg8  = 0,
+    uint64_t arg9  = 0,
+    uint64_t arg10 = 0,
+    uint64_t arg11 = 0
 ) noexcept;
 
 bool detect_ntdll_inline_hooks() noexcept;
@@ -59,7 +61,7 @@ bool detect_ntdll_inline_hooks() noexcept;
 // during active function execution and re-encrypts with a mutated rolling key
 // immediately upon return.
 // ============================================================================
-bool init_jit_vcode_vault(
+VPACK_INIT_CODE bool init_jit_vcode_vault(
     uint8_t* vcode_base,
     size_t   vcode_size,
     uint64_t boot_key,
@@ -102,12 +104,14 @@ public:
         : mod_hash_(mod_hash), fn_hash_(fn_hash), encoded_ptr_(0) {}
 
     FnPtr get() noexcept {
-        constexpr uint64_t kMask = 0xD6E8FEB86659FD93ULL;
+        const uintptr_t dyn_mask = static_cast<uintptr_t>(
+            crypto::poly_permute_64(reinterpret_cast<uint64_t>(this) ^ mod_hash_, fn_hash_)
+        );
         if (encoded_ptr_ == 0) {
             void* raw = resolve_export_by_hash(mod_hash_, fn_hash_);
-            encoded_ptr_ = reinterpret_cast<uintptr_t>(raw) ^ static_cast<uintptr_t>(mod_hash_ ^ fn_hash_ ^ kMask);
+            encoded_ptr_ = reinterpret_cast<uintptr_t>(raw) ^ dyn_mask;
         }
-        uintptr_t decoded = encoded_ptr_ ^ static_cast<uintptr_t>(mod_hash_ ^ fn_hash_ ^ kMask);
+        uintptr_t decoded = encoded_ptr_ ^ dyn_mask;
         return reinterpret_cast<FnPtr>(decoded);
     }
 

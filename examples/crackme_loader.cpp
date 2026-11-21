@@ -347,27 +347,17 @@ int main() {
                         VPACK_STR("      - .vcode JIT Gen      : ").c_str(),
                         static_cast<unsigned long long>(vpack::antidump::vcode_jit_generation()));
             std::printf("%s0x%x\n", VPACK_STR("      - Threat Flags        : ").c_str(), rep.flags);
-            if (rep.flags & vpack::antidebug::THREAT_DLL_INJECTED) {
-                std::printf("%s%s @ 0x%llx\n",
-                            VPACK_STR("      - [!] Injected DLL    : ").c_str(),
-                            rep.injected_module_name,
-                            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(rep.injected_module_base)));
-            }
         } else if (choice == "2") {
             std::printf("%s", VPACK_STR("\n  [*] Monitoring Process Memory for 10 seconds...\n").c_str());
             for (int t = 1; t <= 10; ++t) {
                 hidden_sleep(1000);
                 vpack::antidebug::DebugReport rep{};
                 bool clean = vpack::Protector::verify_environment(&rep);
-                std::printf("%s%d%s%s",
+                std::printf("%s%d%s%s\n",
                             VPACK_STR("      [Tick #").c_str(),
                             t,
                             VPACK_STR("/10] Integrity: ").c_str(),
                             (clean ? VPACK_STR("OK").c_str() : VPACK_STR("ALERT").c_str()));
-                if (rep.flags & vpack::antidebug::THREAT_DLL_INJECTED) {
-                    std::printf("%s%s", VPACK_STR(" | [!] Injected DLL: ").c_str(), rep.injected_module_name);
-                }
-                std::printf("\n");
                 std::fflush(stdout);
             }
         } else if (choice == "3" || choice == "exit" || choice == "quit") {

@@ -16,7 +16,8 @@ enum VmReg : uint8_t {
     R8, R9, R10, R11, R12, R13, R14, R15,
     VTMP0 = 16,
     VTMP1 = 17,
-    REG_COUNT = 18
+    VTMP2 = 18,
+    REG_COUNT = 19
 };
 
 enum VmFlags : uint32_t {
@@ -69,7 +70,7 @@ enum LogicalOpcode : uint8_t {
     OP_ROTATE_REGS,
     OP_STATE_MATRIX,
     OP_ENTANGLE_ENV,
-    // Extended x86_64 Native Lifter Opcodes (Full Jcc + Variable Shift + Zero-Extend)
+    // Extended x86_64 Native Lifter Opcodes (Full Jcc + Variable Shift + Zero-Extend + Sized Memory + Calls)
     OP_JGE,
     OP_JLE,
     OP_JA,
@@ -81,6 +82,23 @@ enum LogicalOpcode : uint8_t {
     OP_SAR_IMM,
     OP_MOVZX32,
     OP_RET,
+    OP_LOAD8,
+    OP_LOAD16,
+    OP_LOAD32,
+    OP_STORE8,
+    OP_STORE16,
+    OP_STORE32,
+    OP_SAR_REG,
+    OP_JS,
+    OP_JNS,
+    OP_JO,
+    OP_JNO,
+    OP_ADD_IMAGE_BASE,
+    OP_CALL_ABS,
+    OP_LEA_ADD,
+    OP_LEA_SHL,
+    OP_SAVE_FLAGS,
+    OP_RESTORE_FLAGS,
     OP_MAX_COUNT
 };
 
@@ -193,6 +211,7 @@ struct VmContext {
     uint64_t                        stack_key = 0;
     uint64_t                        env_poison = 0;
     uint32_t                        flags = FLAG_NONE;
+    uint32_t                        saved_flags = FLAG_NONE;
     bool                            halted = false;
     bool                            tampered = false;
 
@@ -413,6 +432,7 @@ public:
     BytecodeBuilder& sar_imm(VmReg dst, uint8_t shift);
     BytecodeBuilder& shl_reg(VmReg dst, VmReg shift_reg);
     BytecodeBuilder& shr_reg(VmReg dst, VmReg shift_reg);
+    BytecodeBuilder& sar_reg(VmReg dst, VmReg shift_reg);
     BytecodeBuilder& rol_imm(VmReg dst, uint8_t shift);
     BytecodeBuilder& ror_imm(VmReg dst, uint8_t shift);
     BytecodeBuilder& not_reg(VmReg dst);
@@ -433,11 +453,27 @@ public:
     BytecodeBuilder& jb(const std::string& target_label);
     BytecodeBuilder& jae(const std::string& target_label);
     BytecodeBuilder& jbe(const std::string& target_label);
+    BytecodeBuilder& js(const std::string& target_label);
+    BytecodeBuilder& jns(const std::string& target_label);
+    BytecodeBuilder& jo(const std::string& target_label);
+    BytecodeBuilder& jno(const std::string& target_label);
 
     BytecodeBuilder& push(VmReg src);
     BytecodeBuilder& pop(VmReg dst);
+    BytecodeBuilder& load8(VmReg dst, VmReg addr_reg);
+    BytecodeBuilder& load16(VmReg dst, VmReg addr_reg);
+    BytecodeBuilder& load32(VmReg dst, VmReg addr_reg);
     BytecodeBuilder& load64(VmReg dst, VmReg addr_reg);
+    BytecodeBuilder& store8(VmReg addr_reg, VmReg src);
+    BytecodeBuilder& store16(VmReg addr_reg, VmReg src);
+    BytecodeBuilder& store32(VmReg addr_reg, VmReg src);
     BytecodeBuilder& store64(VmReg addr_reg, VmReg src);
+    BytecodeBuilder& add_image_base(VmReg dst);
+    BytecodeBuilder& call_abs(VmReg target_reg);
+    BytecodeBuilder& lea_add(VmReg dst, VmReg src);
+    BytecodeBuilder& lea_shl(VmReg dst, uint8_t shift);
+    BytecodeBuilder& save_flags();
+    BytecodeBuilder& restore_flags();
     BytecodeBuilder& call_native(uint16_t slot_id, VmReg dst_ret);
     BytecodeBuilder& anti_debug_check();
     BytecodeBuilder& mba_add(VmReg dst, VmReg src);

@@ -2,9 +2,11 @@
 emu/
 tests/
 build/
+build-ninja/
 Bin/
 .vs/
 .vscode/
+minidbgC.cs
 
 # Binary and intermediate artifacts
 *.exe
